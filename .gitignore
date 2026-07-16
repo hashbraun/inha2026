@@ -1,0 +1,33 @@
+# 대용량 데이터 및 모델 가중치 (git 제외)
+data/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# 생성된 출력물
+submission_kit/input_videos/*.mp4
+submission_kit/submission_features.csv
+submission_kit/sample_submission.csv
+baseline/outputs/
+
+# Python 빌드
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# 환경
+.env
+*.log
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# 시각화 결과 (선택적으로 포함 가능)
+# eval_samples_preview.png
+# eval_action_distribution.png
