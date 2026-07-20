@@ -37,6 +37,7 @@ class SO100DataModule(LightningDataModule):
         eval_all_episodes: bool = False,
         num_workers: int = 0,
         pin_memory: bool = True,
+        gripper_smooth: bool = False,
     ) -> None:
         super().__init__()
         self.root = root
@@ -63,6 +64,7 @@ class SO100DataModule(LightningDataModule):
         self.eval_all_episodes = eval_all_episodes
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.gripper_smooth = gripper_smooth
         self.train_dataset = None
         self.val_dataset = None
 
@@ -106,6 +108,7 @@ class SO100DataModule(LightningDataModule):
             cache_dir=self.cache_dir,
             temporary_downloads=self.temporary_downloads,
             hf_token=self.hf_token,
+            gripper_smooth=self.gripper_smooth,
         )
         action_stats = self._load_or_compute_action_stats() if self.normalize_actions else None
         if action_stats is not None:

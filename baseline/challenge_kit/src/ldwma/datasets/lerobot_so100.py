@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn.functional as F
+from scipy.signal import medfilt
 from huggingface_hub import HfFolder, hf_hub_download, hf_hub_url, list_repo_files
 from torch.utils.data import Dataset
 
@@ -234,6 +235,7 @@ class LeRobotSO100Dataset(Dataset):
         temporary_downloads: bool = False,
         hf_token: str | None = None,
         use_all_episodes: bool = False,
+        gripper_smooth: bool = False,
     ) -> None:
         self.root = Path(root) if root is not None else None
         self.remote = remote
@@ -251,6 +253,8 @@ class LeRobotSO100Dataset(Dataset):
         self.override_fps = fps
         self.override_frame_stride = frame_stride
         self.rng = random.Random(seed)
+        self.train = train
+        self.gripper_smooth = gripper_smooth and train
         self.action_mean = torch.tensor(action_mean, dtype=torch.float32) if action_mean is not None else None
         self.action_std = torch.tensor(action_std, dtype=torch.float32) if action_std is not None else None
 
@@ -388,6 +392,10 @@ class LeRobotSO100Dataset(Dataset):
         actions = np.stack(table["action"].iloc[frame_indices].to_numpy()).astype(np.float32)
         if actions.shape[-1] != 6:
             raise ValueError(f"Expected SO-100 action dim 6, got {actions.shape[-1]} from {example['data_ref']}.")
+
+        # C2: gripper median smoothing (train only) — smooths 0/1 binary transitions
+        if self.gripper_smooth and len(actions) >= 3:
+            actions[:, 5] = medfilt(actions[:, 5], kernel_size=3)
 
         with self._materialize_file(example["video_ref"]) as video_path:
             video = _decode_video_clip(video_path, frame_indices)
