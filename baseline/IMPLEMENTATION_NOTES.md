@@ -100,6 +100,17 @@ L_total = L_ae
 
 ---
 
+## v6 변경사항 (Flash Decoupled Noise)
+
+- `--flash-noise` 플래그로 활성화
+- video sigma: `Beta(7,1)` 독립 샘플 (E[σ]≈0.875, 항상 고노이즈)
+- action sigma: `U(0,1)` 독립 샘플 (video와 무관)
+- 두 sigma가 독립이므로 DiT가 video 복원 시 구조적으로 action token 의존
+- Teacher Forcing (`clean_x≠None`)은 `action≠None`과 동시 사용 불가 (Job 28227 크래시, blockwise attn layout 충돌) → 영구 제외
+- 추론 코드 수정 불필요: infer_dreamzero_action_inpaint.py의 re-noising이 이미 적절히 처리
+
+---
+
 ## 과거 실패 이력
 
 | Job | 원인 | 수정 |

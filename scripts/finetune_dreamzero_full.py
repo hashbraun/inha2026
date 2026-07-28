@@ -288,6 +288,8 @@ def main():
                         help="Lower bound of sigma range for timestep sampling")
     parser.add_argument("--sigma-high",       type=float, default=0.6,
                         help="Upper bound of sigma range for timestep sampling")
+    parser.add_argument("--flash-noise",      action="store_true",
+                        help="DreamZero-Flash decoupled noise: video~Beta(7,1), action~U(0,1) independently")
     parser.add_argument("--grad-accum",       type=int,   default=4)
     parser.add_argument("--max-clips",        type=int,   default=5000)
     parser.add_argument("--save-every",       type=int,   default=500)
@@ -427,6 +429,13 @@ def main():
     print(f"[train] σ range [{args.sigma_low},{args.sigma_high}] → t_id [{t_id_min},{t_id_max}] "
           f"({t_id_max - t_id_min}/{num_train_ts} steps)")
 
+    # ── Flash decoupled noise 준비 ───────────────────────────────────────────
+    if args.flash_noise:
+        _beta_dist = torch.distributions.Beta(
+            torch.tensor(7.0), torch.tensor(1.0)
+        )
+        print("[train] Flash noise enabled: video~Beta(7,1), action~U(0,1) independent")
+
     # ── Training loop ────────────────────────────────────────────────────────
     print("[train] Starting...")
     log_path = out_dir / "train_log.jsonl"
@@ -482,7 +491,27 @@ def main():
         if step == 1:
             print(f"[debug] T={T} frames → z shape={list(z.shape)}, T_lat={T_lat}, frame_seqlen={tokens_per_frame}")
 
-        t_id = torch.randint(t_id_min, t_id_max, (B, T_lat), device="cuda:0")
+        if args.flash_noise:
+            # ── Flash decoupled noise ────────────────────────────────────
+            # Video: Beta(7,1) → E[σ]≈0.875, 항상 고노이즈 바이어스
+            sigma_v_raw = _beta_dist.sample((B * T_lat,)).float()  # [0,1]
+            # 각 sigma_v_raw에 대해 가장 가까운 t_id를 찾음
+            # all_sigmas: (N,), sigma_v_raw: (B*T_lat,) → diff: (B*T_lat, N)
+            t_id_flat = torch.argmin(
+                (all_sigmas.unsqueeze(0) - sigma_v_raw.unsqueeze(1)).abs(), dim=1
+            ).clamp(0, len(all_sigmas) - 2)            # (B*T_lat,)
+            t_id = t_id_flat.reshape(B, T_lat)          # (B, T_lat)
+
+            # Action: U(0,1) 독립 샘플
+            sigma_a_raw = torch.rand(B).float()          # [0,1]
+            t_scalar_a = torch.argmin(
+                (all_sigmas.unsqueeze(0) - sigma_a_raw.unsqueeze(1)).abs(), dim=1
+            ).clamp(0, len(all_sigmas) - 2)             # (B,)
+        else:
+            # ── Standard coupled noise (기존) ────────────────────────────
+            t_id = torch.randint(t_id_min, t_id_max, (B, T_lat))  # (B, T_lat)
+            t_scalar_a = t_id[:, 0]                                 # (B,)
+
         timestep = action_head.scheduler.timesteps[t_id.cpu()].to("cuda:0")
 
         noisy_z = action_head.scheduler.add_noise(
@@ -501,16 +530,13 @@ def main():
         clean_action_np[:T_act, :6] = actions_norm[:T_act].numpy()
         clean_action = torch.from_numpy(clean_action_np).unsqueeze(0).to("cuda:0", dtype=torch.bfloat16)  # (1, 24, 32)
 
-        # timestep for action_encoder: scalar per batch, same σ range as video
-        t_scalar = t_id[:, 0]  # (B,)
-        timestep_scalar = action_head.scheduler.timesteps[t_scalar.cpu()].to("cuda:0")  # (B,)
-
-        # ── Noisy action (공통) ──────────────────────────────────────────
-        sigma_a = action_head.scheduler.sigmas[t_scalar.cpu()].to("cuda:0", dtype=torch.float32)[:, None, None]
+        # ── Noisy action ─────────────────────────────────────────────────
+        timestep_scalar_a = action_head.scheduler.timesteps[t_scalar_a.cpu()].to("cuda:0")  # (B,)
+        sigma_a = all_sigmas[t_scalar_a].to("cuda:0", dtype=torch.float32)[:, None, None]
         noise_a = torch.randn_like(clean_action)
         noisy_a = ((1.0 - sigma_a) * clean_action + sigma_a * noise_a).to(dtype=torch.bfloat16)
         v_a_target = (noise_a - clean_action).float()
-        ts_expanded = timestep_scalar[:, None].expand(-1, action_horizon)  # (B, 24)
+        ts_expanded = timestep_scalar_a[:, None].expand(-1, action_horizon)  # (B, 24)
 
         action_head.set_frozen_modules_to_eval_mode()
         action_head.train()
