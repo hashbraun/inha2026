@@ -548,8 +548,12 @@ def main():
     )
     transformer.add_adapter(lora_config)
     lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n]
+    # FREEZE_LORA=1 → LoRA freeze, action_proj만 학습 (native path full fine-tune)
+    freeze_lora = os.environ.get("FREEZE_LORA", "0") == "1"
     for p in lora_params:
-        p.requires_grad_(True)
+        p.requires_grad_(not freeze_lora)
+    if freeze_lora:
+        print(f"[FREEZE_LORA=1] LoRA 파라미터 {len(lora_params)}개 freeze — action_proj/embed만 학습", flush=True)
 
     transformer.action_proj_in.requires_grad_(True)
     transformer.action_proj_out.requires_grad_(True)
