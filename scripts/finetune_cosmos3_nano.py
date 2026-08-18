@@ -21,10 +21,15 @@ forward하면 gradient가 자동으로 도메인 7 행에만 흐른다 (다른 �
 import argparse
 import glob
 import json
+import os
 import random
 import sys
 import time
 from pathlib import Path
+
+# ACTION_SIGMA_CLAMP=0 → (1-sigma).clamp weighting 제거 (constant weight)
+# 기본값 1 (기존 동작 유지, 하위호환)
+_ACTION_SIGMA_CLAMP = os.environ.get("ACTION_SIGMA_CLAMP", "1") == "1"
 
 import cv2
 import numpy as np
@@ -434,7 +439,12 @@ def train_step(pipe, transformer, batch, device, dtype, scheduler, generator, ac
         gt = torch.from_numpy(joints[:pred_frames]).to(device=device, dtype=torch.float32)
         gt_norm = ((gt - action_mean) / action_std).unsqueeze(0)  # (1,T,6)
         action_loss = F.mse_loss(pred_action.float(), gt_norm)
-        weight = float(action_loss_weight) * float((1.0 - sigma).clamp(min=0.0, max=1.0))
+        # ACTION_SIGMA_CLAMP=0 시 sigma-independent constant weight.
+        # 기본(=1)은 기존 (1-sigma).clamp 유지 — 하위호환.
+        if _ACTION_SIGMA_CLAMP:
+            weight = float(action_loss_weight) * float((1.0 - sigma).clamp(min=0.0, max=1.0))
+        else:
+            weight = float(action_loss_weight)
         loss = flow_loss + weight * action_loss
     else:
         loss = flow_loss
