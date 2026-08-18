@@ -1,166 +1,157 @@
-# Handoff — 2026-08-19 (D-1)
+# Handoff — 2026-08-19 (auto loop v2 continuous mode)
 
-## 대회
-- **Dacon 236736**, 인하 AI 챌린지 World Model Challenge
-- 마감 **2026-08-20 18:00 KST** (남은 ~28-33h 기준 08-19 기준)
-- 채점: `0.3·(1-DINO_cos) + 0.3·(1-Video_cos R3D-18) + 0.4·Action_MAE`
+## ⚡ 다음 세션 즉시 재개 프롬프트
 
-## ⚡ 즉시 재개 프롬프트 (다음 세션)
 ```
-inha2026 D-day 24-30h 남음. 다음 파일 순서로 읽고 자동 loop 이어서:
-1. docs/plans/fresh_restart/HANDOFF_2026-08-19.md  (이 파일)
-2. logs/fresh/auto_loop.log  (auto_loop 최신 tick)
-3. logs/fresh/orchestrator_state.json  (state)
-4. squeue -u sota  (진행 job)
-5. 필요 시 새 candidate launch 후 auto_loop 재시작
+inha2026 D-day 임박. 자동화 v2 실행 중 (사용자 KILL까지 무한 loop).
+아래 순서 확인:
+1. /home1/sota/inha2026/HANDOFF_2026-08-19_root.md (이 파일)
+2. squeue -u sota (활성 job)
+3. tail -50 /home1/sota/inha2026/logs/fresh/auto_loop_v2.log
+4. cat /home1/sota/inha2026/logs/fresh/auto_loop_v2_state.json | head -80
+5. ls /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick*.txt (최신 codex 자문)
+6. 최신 CSV: ls -lt /home1/sota/inha2026/submission_kit/fresh/submission_b4_sw*.csv
 ```
 
-## 확정 자산 (실측 검증)
+## 대회 확정 사실
+- Dacon 236736, 마감 **2026-08-20 18:00 KST**
+- 채점 `0.3·(1-DINO_cos) + 0.3·(1-Video_cos R3D-18) + 0.4·Action_MAE` (lower better)
+
+## 실측 확정 자산
 | CSV | Action mean | 실측 LB | 상태 |
 |---|---|---|---|
-| **v5b_ANCHORED_soft** | 0.3886 | **0.24524** | 안전본 (필수 제출) |
-| **B4 step6000** | 0.3798 | **0.2407** | 도전본 (안전본 -0.0045 개선) |
-| e_select_ANCH | 0.3625 | 0.263 | 폐기 (visual 손상) |
+| **v5b_ANCHORED_soft.csv** | 0.3886 | **0.24524** | 안전본 필수 제출 |
+| **submission_b4_step6000.csv** | 0.3798 | **0.2407** | 도전본 (안전본 -0.0045 개선) |
+| e_select_ANCH.csv | 0.3625 | 0.263 | 폐기 (visual 손상) |
 | tier1_seed1 | ? | 0.270 | 참고 |
-| tto_v5b_ANCH_dino16 | 0.078 | 0.04 | **규정 위반, 절대 제출 금지** |
+| tto_v5b_ANCH_dino16.csv | 0.078 | 0.04 | **규정 위반, 절대 지정 금지** |
 
 ## 실패 이력 (재시도 금지)
-| 시도 | Action mean | LB | 원인 |
-|---|---|---|---|
-| B4v2 (constant weight 0.15) | 0.3735 | 0.2508 | Visual +0.010 손상 |
-| Z5 (shuffled ranking + cross-attn) | 0.3970 | 0.2478 예상 | Objective misalign, visual 훼손 |
-| Z6-lite step2000 (bounded α=0.08) | 0.3813 | 0.2415 예상 | B4 미달 |
-| Z6-B4 hybrid step15000 | 0.3780 | **0.2499 실측** | 82M adapter + 장기학습 → visual 손상 |
-| NAP (LoRA freeze) step8000 | 0.3819 | 0.2418 예상 | LoRA freeze로 표현력 부족 |
-| Cosmos-Predict2.5 falsification | - | - | G5 FAIL (eff_action=0.64) 2회 재현 |
-| Fresh DiT scratch | 0.956 | 나쁨 | Video prior 부재 |
-| Track E Wan2.1-Fun | - | 0.70+ | 통합 실패 |
+- **B4v2** (constant weight 0.15): LB 0.2508 (visual +0.010 손상)
+- **Z6-B4 hybrid step15000**: LB 0.2499 (82M adapter + 장기학습 visual 손상)
+- **Z5 shuffled ranking**: 예상 0.2478
+- **Z6-lite step2000**: 예상 0.2415 (B4 미달)
+- **NAP step8000**: 예상 0.2418 (LoRA freeze 표현력 부족)
+- **Cosmos-Predict2.5**: G5 falsification FAIL 2회 (backbone action-agnostic)
 
-## 진행 중 학습 (2026-08-19 아침)
-| Job | 내용 | GPU | 상태 |
-|---|---|---|---|
-| **30749** | B4 sweep weight=0.025, 12k step | Blackwell gpu-113 | pending → running |
-| **30750** | B4 sweep weight=0.075, 12k step | Blackwell (depends 30749) | pending |
-| **30751** | B4 sweep weight=0.05, 12k step (control) | Blackwell (depends 30750) | pending |
+## Auto loop v2 (사용자 KILL까지 무한 실행)
 
-각 job ~4-5h. Total sequential ~12-15h.
+### 실행 정보
+- PID: **794036**
+- Log: `/home1/sota/inha2026/logs/fresh/auto_loop_v2.log`
+- State: `/home1/sota/inha2026/logs/fresh/auto_loop_v2_state.json`
+- Tick: 10분
+- **종료 조건**: 사용자 KILL만 (`kill 794036`)
 
-## Auto loop (PID 431820)
-- 10분 tick
-- 각 candidate 학습 완료 → 자동 inference launch (여러 ckpt) → CSV Action mean 계산
-- Action < 0.375 → success (사용자 실측 slot 확인 요청)
-- Action 0.375-0.379 → marginal
-- Action ≥ 0.379 → failed → 다음 pivot
+### 자동 동작
+1. **각 candidate 학습 완료** → 여러 ckpt (4k/6k/8k/10k/12k) auto inference
+2. **Inference 완료** → CSV Action mean 계산
+3. **판정**:
+   - `Action < 0.35`: **big_success** → 사용자 실측 slot 요청 (loop 계속)
+   - `Action < 0.3798`: marginal (loop 계속)
+   - `Action ≥ 0.3798`: failed (loop 계속)
+4. **각 pivot event** → **Codex 자문 자동 launch** (로그+state embed, `--sandbox danger-full-access`)
+   - 파일: `docs/plans/fresh_restart/codex_pivot_tick{N}.txt`
+5. **모든 candidate settled** → 다음 후보 자동 queue launch (seed reproduction 등, 무한 continue)
 
-State: `logs/fresh/auto_loop_state.json`
-
-## 자동 Pivot Queue (실패 시 자동 진행)
-
-### 1단계: B4 sweep 결과 판정 (진행 중, ~12-15h 후)
-- 최선 ckpt Action mean 확인
-- < 0.375: 사용자 실측 slot 사용 요청
-- ≥ 0.375: 다음 단계
-
-### 2단계: **Action-magnitude weighted B4** (준비 완료, 미실행)
-- 파일: `scripts/track_z5/finetune_b4_magweight.py`
-- 큰 action 시퀀스만 loss weight ↑ (기존 B4 성능 유지 + 큰 움직임 학습 집중)
-- Env: `MAG_ALPHA=0.5 MAG_MEDIAN=7.3 MAG_STD=9.0`
-- Launch:
-```bash
-# Blackwell sbatch (기존 b4_v5b_e_loss_bw.sbatch 참조)
-export MAG_ALPHA=0.5
-sbatch --nodelist=gpu-113 <새 sbatch>  # finetune_b4_magweight.py 실행
+### 활성 학습 chain (Blackwell sequential)
 ```
-- Motion score 분포 (측정됨):
-  - median 7.3, mean 9.3, p90 22.8, max 50.0
-  - alpha=0.5로 z-score 기반 [0.5, 3.0] clip
+30749: B4 sweep w=0.025, 12k [RUNNING]
+ → 30757: B4 sweep w=0.05, 12k (Codex 권장 성공 basin 재현)
+ → 30758: B4 sweep w=0.075, 12k (조건부)
+ → auto: b4_w005_seed43 (queue, 다음 후보)
+ → auto: b4_w005_seed44 (queue)
+```
 
-### 3단계: B4 checkpoint sweep 세밀 (Codex 권장)
-- B4 6000 base → weight variation 3개 × ckpts 4개 = 12개 조합
-- 이미 30749/30750/30751로 시작
+### B4 원본 세부 ckpt sweep (A6000_ada, 병렬)
+- 30759: step 500 inference
+- 30760: step 1000 inference
+- 30761: step 1500 inference
 
-### 4단계 (최후): RAFT/RL with E invdyn ensemble
-- E invdyn seed 3개 학습 → ensemble reward
-- Diffusion sample rank + fine-tune
-- 시간 20-30h (D-day 마감 위험)
-- **규정 확인 필수** (Codex v5: "각 CSV score 보고 selection도 kit 정보 활용 소지" 있음)
+## Codex 최신 자문 (`codex_log_review.txt`) — 로그 분석 반영
 
-### 5단계 (실패 확정 시): B4 step6000 최종 확정
-- 안전본 v5b_ANCHORED_soft + 도전본 B4 step6000
-- 최소 안전본 대비 -0.0045 개선 확정
+**한 줄**: "30749 계속 + 4k/6k/8k 먼저 평가 + w=0.05 재현으로 전환. 12k endpoint·magweight·새 hybrid보다 checkpoint selection이 기대값·안전성 최고."
 
-## Codex 최종 권장 (`docs/plans/fresh_restart/codex_break_b4.txt`)
+**핵심 통찰**:
+1. **B4v2 실증**: auxiliary가 flow objective 압도 → visual 파괴
+2. **Z6-B4 hybrid preserve loss**는 flow의 0.05%로 사실상 무효
+3. **Action mean 기반 예상 LB 안전영역 밖에서 무효** (B4v2, hybrid 두 번 예측 실패)
+4. **Training loss 최저점 ≠ LB 최적점** → checkpoint selection이 훨씬 중요
+5. Auto loop v1 bug: pending state ckpt_dir 없어 KeyError (v2에서 수정)
 
-**핵심**: "B4는 우연히 sweet spot. 더 세게·오래보다 근방 촘촘 탐색이 유일한 30% 문턱 전략"
+**적용 완료**:
+- ✅ Magweight (30756) cancelled
+- ✅ Chain swap (30757 w=0.05 → 30758 w=0.075, Codex 권장 우선순위)
+- ✅ B4 원본 세부 ckpt sweep (30759-30761)
+- ✅ auto_loop v1 kill → v2로 교체 (codex 자문 자동 통합)
 
-**확률 순위**:
-1. B4 continuation + 다중 ckpt + IDM ensemble selection: **40-55%**
-2. B4 + preserve-only 6-12k sweep: **35-45%**
-3. Z6-B4 hybrid + checkpoint selection: 35-45% (실측 실패 확정)
-4. Z6-B4 hybrid 단발 15k: 25-35% (실측 확정)
-5. B4 longer flat/decay: 25-35%
-6. NAP + differential LR: 20-30%
-7. RAFT/DPO/RL 현 predictor: 10-20%
-8. 새 backbone: 5-15%
+## Pivot Queue (settled 후 자동 launch)
 
-## 코드 자산 (커밋됨 commit 8c31cec)
+### 1단계 (실행 중)
+- B4 sweep chain: w=0.025 → w=0.05 → w=0.075
+- B4 원본 세부 (step 500/1000/1500 inference)
 
-- `scripts/finetune_cosmos3_nano.py`: ACTION_SIGMA_CLAMP env var + FREEZE_LORA env var 지원
-- `scripts/track_z5/crossattn_adapter.py`: Z5 adapter (실패)
-- `scripts/track_z5/crossattn_adapter_z6.py`: Z6 bounded adapter (실패)
-- `scripts/track_z5/finetune_z5.py`: Z5 학습 (실패)
-- `scripts/track_z5/finetune_z6.py`: Z6-lite/hybrid (실패)
-- `scripts/track_z5/infer_z5.py`: Z5/Z6 inference (성공)
-- `scripts/track_z5/finetune_b4_magweight.py`: **NEW** action-magnitude weighted B4 (준비, 미실행)
-- `scripts/track_z5/orchestrator_z6_p25.py`: Z6+P25 orchestrator (P25 폐기 후 종료)
-- `scripts/track_z5/auto_loop.py`: continuous auto loop (진행 중 PID 431820)
+### 2단계 (queue, auto launch)
+- **b4_w005_seed43**: `b4_seed_repro_v2.sbatch`, w=0.05 seed 43 재현
+- **b4_w005_seed44**: `b4_seed_repro_v3.sbatch`, w=0.05 seed 44 재현
+- Codex 조언: "성공한 정확한 w=0.05 step6000 재현 - variance 확인"
 
-## 규정 재확인
-- 금지: `submission_kit/checkpoints/action_extractor.ckpt` (GRU), R3D-18, DINOv2 학습/selection/mp4 수정 사용
-- 허용: 외부 pretrained (Cosmos3, Wan 등), 자체 clean-room predictor (E invdyn)
-- 애매: TTO/RL sample rank (Codex v5 우려)
+### 3단계 (Codex 조언 시 추가 launch)
+- Action-only mild weighting (clip [0.75, 1.5], mean-normalized) — Codex 재설계 안전 형태
+- Large-motion stratified sampling
+- B4 + ANCH prediction blend (매우 보수적, 1개만)
+
+### 4단계 (마감 후로 미룸)
+- E/invdyn ensemble 재학습
+- 새 backbone (Wan2.2, DreamZero 14B)
+- RAFT/DPO/RL
+
+## 규정
+- 금지: submission_kit action_extractor(GRU), R3D-18, DINOv2 학습/selection/mp4 수정 사용
+- 허용: 외부 pretrained + 자체 clean-room predictor (E invdyn)
 - **최종 지정 절대 금지**: TTO CSV 3개 (실격)
 
-## Key Insight (뼈아픈 교훈)
-1. **Pattern 1**: 우리 자체 predictor (E invdyn) vs kit GRU 부호 반전 (판독기 v2 실측)
-   - 어떤 auxiliary loss도 kit GRU와 tight coupling 못함
-2. **Pattern 2**: 예상 LB 회귀식 (0.4·Action + 0.089) **좋은 영역 밖에서 실패**
-   - B4v2: 예상 0.238 → 실측 0.251 (+0.013)
-   - Z6-B4: 예상 0.240 → 실측 0.250 (+0.010)
-   - Action mean 개선 ≠ LB 개선 (visual 손상 fold)
-3. **B4의 성공 = "미미 조정 + 짧은 학습 + 우연"**
-   - 더 세게 (weight ↑) → visual 손상
-   - 더 오래 (step ↑) → visual 손상
-   - 더 크게 (adapter 추가) → visual 손상
-   - 근방 촘촘 탐색만이 답
-4. **판독기 v2 부호 반전** = 근본 misalign 증거
-   - TTO(kit LB 0.04) → E invdyn L1=0.96 (나쁨)
-   - e_select_ANCH(LB 0.263) → E invdyn L1=0.86 (좋음)
-   - **자체 predictor로 kit GRU 완벽 근사 불가능**
+## 자원
+- Blackwell gpu-113: `inha2026_bw` env (torch 2.15dev), LD_LIBRARY_PATH nvidia sub-package 필수
+- A6000_ada gpu-108/109/110/112: `inha2026` env
+- **B4 계열은 Blackwell 필수** (A6000 44GB OOM)
 
-## 자원 및 환경
-- Blackwell gpu-113 (95GB × 1, sm_120): `inha2026_bw` env (torch 2.15dev, cu130)
-  - `LD_LIBRARY_PATH`에 nvidia sub-package `/lib` 필수
-- A6000_ada gpu-108/109/110/112 (44GB × 8): `inha2026` env
-- **B4 계열은 Blackwell 필요** (A6000 44GB에서 OOM)
-- Wan2.2 다운로드 완료: `models/wan22_ti2v_5b/` (32GB, 미사용)
-- Cosmos-Predict2.5 ckpt: `models/predict2.5_action_cond/` (4.25GB, G5 실패 확정)
+## 다음 세션 대응 시나리오
 
-## 최종 제출 전략 (D-day)
+### A. Auto loop 정상 진행 중
+- 최신 codex_pivot_tick*.txt 읽고 조언 확인
+- 사용자 결정 필요한 이벤트 (big_success)만 응답
 
-**시나리오 A** (Sweep에서 성공 candidate 발견):
-- 안전본: v5b_ANCHORED_soft.csv
-- 도전본: 최선 Action mean CSV (실측 확인 후)
+### B. Auto loop 프로세스 죽음
+```
+nohup /home1/sota/anaconda3/envs/inha2026/bin/python \
+  /home1/sota/inha2026/scripts/track_z5/auto_loop_v2.py \
+  > /home1/sota/inha2026/logs/fresh/auto_loop_v2_stdout.log 2>&1 &
+```
+State 파일 그대로 이어서 진행 (json 유지)
 
-**시나리오 B** (Sweep 실패):
-- Action-magnitude weighted B4 시도 (~6h)
-- 성공 시 새 도전본
+### C. Big success (Action < 0.35) 발견
+- 해당 CSV 실측 slot 사용 여부 사용자 결정 요청
+- 실측 결과 좋으면 새 도전본 지정
 
-**시나리오 C** (모두 실패):
-- 안전본: v5b_ANCHORED_soft.csv (0.24524)
-- 도전본: **B4 step6000 (0.2407)** ← 확정 -0.0045 개선
+### D. 마감 임박 (< 10h)
+- 신규 학습 launch 금지 (Codex 강력 권장)
+- `kill 794036` (auto loop 정지)
+- 진행 중 학습 kill 검토
+- 검증/제출 buffer 확보 최우선
 
-**어느 시나리오든 최소 도전본 = B4 step6000 (실측 확정)**.
+### E. 최종 제출 (D-day)
+- 안전본: `submission_ANCHORED_soft.csv` (0.24524)
+- 도전본: 최선 실측 CSV (없으면 `submission_b4_step6000.csv` 0.2407)
+- TTO CSV 3개 절대 지정 금지
 
-## 규정 위반 CSV 폐기 확인
-`submission_kit/fresh/submission_tto_*.csv` 3개는 절대 지정 금지. 파일 자체는 남겨도 최종 제출 시 절대 선택 X.
+## Git 상태
+- Branch: `yunjae`
+- 최근 commit: `d8ea392` (D-1 handoff + mag-weighted + auto loop)
+- 이번 세션 새 파일: `auto_loop_v2.py`, `b4_seed_repro_v{2,3}.sbatch`, 이 HANDOFF 업데이트
+
+## Key insight (뼈아픈 교훈)
+- **Pattern 1**: E invdyn(자체) vs kit GRU 부호 반전. 어떤 auxiliary도 tight coupling 불가.
+- **Pattern 2**: 예상 LB 회귀식 `0.4·A + 0.089` 안전영역 밖에서 실패 (B4v2 +0.013, hybrid +0.010 오차).
+- **B4 성공 = 미미 조정 + 짧은 학습 + 우연**. 더 세게/오래/크게 = 필패.
+- **Codex 최선**: B4 근방 촘촘 탐색 + checkpoint selection이 유일한 30% 문턱 방식.
