@@ -1,0 +1,1660 @@
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota/inha2026
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a01ad0-9243-7f82-b849-e908df5c042e
+--------
+user
+CONTEXT: inha2026 D-day 16.5h 남음 (2026-08-20 18:00 KST 마감). 사용자 신규 제안 검토 필요.
+
+## 상황 정리 (신규 발견)
+
+### 우리 학습 코드 실측 (finetune_cosmos3_nano.py line 543-561)
+```python
+transformer.requires_grad_(False)              # 전체 freeze
+# LoRA (attention/MLP): 학습됨
+transformer.action_proj_in.requires_grad_(True)   # ★ action pathway 학습됨
+transformer.action_proj_out.requires_grad_(True)  # ★
+transformer.action_modality_embed.requires_grad_(True)  # ★
+```
+→ action_proj_in/out + action_modality_embed도 **매 step 함께 학습**됨. 심지어 `--proj-lr-mult` 별도 higher LR.
+
+### B4 action-video alignment 실측 결과 (방금 완료)
+| Checkpoint | gt-zero MAE (action grounding) |
+|---|---|
+| v5b_base 40k step | **8.98** |
+| B4 (v5b→+E-loss 6k) | **7.10** ← 약해짐 |
+
+→ Action pathway 학습이 진행될수록 Bridge 프리트레인 knowledge를 216 clip으로 덮어써서 catastrophic forgetting 진행.
+→ Codex 이전 자문 "Action↓ 하면 Visual↑ Pareto 벽 실측 확인"의 근본 원인이 이것일 수 있음.
+
+## 사용자 신규 제안 (검토 대상)
+
+> FD 단독이면 — 액션을 뺀 워밍업 말고, **액션은 계속 넣되 액션 경로를 얼려**. Stage 1에서 action conditioner(MLP + modulation)를 frozen으로 두고 DiT 백본만 학습해서 시각 도메인만 맞춰. Stage 2에서 액션 경로를 풀어. 이러면 모델이 "액션 없이 예측하는 법"을 배우는 일이 없어.
+
+**구체 제안**:
+- **Stage 1** (5k step): `action_proj_in/out + action_modality_embed` FREEZE, DiT LoRA만 학습
+  - Bridge 프리트레인 action semantics 100% 보존
+  - Visual/scene distribution만 SO-100에 맞춤
+- **Stage 2** (5k step): 전체 unfreeze, 낮은 LR로 미세 조정
+  - SO-100 특유 세부사항 반영, overfit 방지
+
+## 우리 자원 (D-day 예산)
+
+- 시간: 16.5h (01:30 → 18:00 KST)
+- 기존 jobs:
+  - **30758 (b4sw_bw_w0075)**: Blackwell 학습 중, ~3-4h 남음. Kill 여부 결정 필요
+  - Multi-seed rejection sampling 12잡 A6000_ada running (~40분 후 완료)
+- Blackwell = gpu-113 = RTX PRO 6000 Blackwell 95GB, torch 2.15dev+cu130
+- A6000_ada 48GB × 여러 노드
+- LoRA rank 32, delta_base action repr, Cosmos3-Nano 2B
+
+## 실측 자산 (변경 없음)
+- 안전본: v5b_ANCHORED_soft.csv = 0.24524
+- 도전본: B4 step6000 = 0.2407
+- 어제 실측: w0025_cfg45_s35 = 0.2437 (예측식 안전영역 실측 정확)
+- Visual term hard ceiling ≈ 0.089 (모든 우리 fine-tune variant 유사)
+
+## 이전 자문 원칙 재확인
+- "새 학습 launch = 위험" (이전 자문)
+- "216 sample full unfreeze = 심각한 위험" (Predict2.5 자문)
+- "마지막 6-10h는 검증 buffer 확보"
+- 하지만 이 제안은 **LoRA 학습 (parameter 수 적음), 근본적 architecture 개선** → 이전 위험 판단 재적용 여부 판단 필요
+
+## Codex 판단 필요 (brutally honest, 500 words)
+
+1. **원리 검증**:
+   - "Stage 1 action-proj freeze, DiT LoRA만 학습"이 catastrophic forgetting on action grounding을 실제로 막는가?
+   - Bridge 프리트레인 action_proj가 우리 SO-100 delta_base 표현을 잘 처리하는지 이론적으로 어떻게 판단?
+   - 만약 SO-100 delta_base 분포가 Bridge와 다르면 frozen action_proj가 잘못 처리 → 학습 실패 위험. 이걸 사전에 검증할 방법?
+
+2. **B4 실측 데이터 해석 재확인**:
+   - v5b_base 40k gt-zero MAE = 8.98
+   - B4 (v5b + E-loss 6k) gt-zero MAE = 7.10
+   - Action grounding 약화가 정말 action_proj 학습 때문인가, 아니면 E-invdyn loss 자체의 부작용인가?
+   - E-loss를 제거하고 pure flow matching으로만 Stage 1을 하면 v5b_base 40k와 비교해서 실제 개선이 있을까?
+
+3. **시간 예산 실현 가능성**:
+   - Stage 1 5k + Stage 2 5k = 10k step. Blackwell 예상 시간?
+   - 216 inference 2h + 검증 2h + 제출 buffer 2h + 학습 8-10h = 14-16h. 딱 맞음.
+   - 30758 kill 판단: Blackwell 확보 vs w0075 sweep 결과 손실 tradeoff?
+
+4. **realistic LB upside**:
+   - Stage 1+2 성공 시 예상 LB 하한?
+   - 이전 자문 하한 0.237~0.241과 비교, 어느 정도 개선 예측?
+   - visual term 0.089 벽 실제로 뚫을 수 있는가? (visual 개선 vs action 개선 어느 쪽?)
+
+5. **대안과 비교**:
+   - vs Predict2.5 mask fix + LoRA post-train
+   - vs 그냥 B4 유지 + multi-seed rejection만 (안전)
+   - vs Cosmos3-Nano rank 128 확장 (내가 이전 제안)
+   - **어느 게 17h 예산 안에서 realistic best upside인가?**
+
+6. **실행 리스크**:
+   - Stage 1 학습 중 뭔가 signal이 안 좋으면 폐기 판단 언제?
+   - Stage 2 학습이 필수인가, Stage 1 결과로 이미 improvement 나올 가능성?
+   - 만약 Stage 1 실패 시 B4 도전본 방어 유지 가능한가?
+
+7. **즉시 결정**:
+   - 30758 kill 하고 Blackwell에 Stage 1 launch = OK?
+   - 아니면 30758 완료 후 (3-4h 뒤) Stage 1 launch?
+   - 대안: A6000_ada에서 병렬 launch (더 느리지만 30758 유지)?
+
+이전 자문 (codex_predict25_plan.txt, codex_extreme_v2_plan.txt, codex_pivot_tick40.txt) 원칙과 모순 없이 판단.
+특히 "Predict2.5 학습 시작 금지, 검증부터" 원칙 vs 이 제안 (다른 학습이지만 근본적) 관계 명확화.
+
+codex
+요청하신 이전 자문 파일과 실제 학습 코드/로그를 먼저 대조하겠습니다. 시간 추정은 현재 잡 상태와 step 처리량을 확인해 수치로 잡고, 결론은 500단어 안팎으로 냉정하게 압축하겠습니다.
+exec
+/bin/bash -lc "rg -n \"requires_grad|proj-lr-mult|action_proj|action_modality|Stage|Predict2.5|학습 시작|검증|Blackwell|step\" finetune_cosmos3_nano.py codex_predict25_plan.txt codex_extreme_v2_plan.txt codex_pivot_tick40.txt 2>/dev/null; find . -maxdepth 3 -type f \\( -iname '*30758*' -o -iname '*b4sw*' -o -iname '*.out' -o -iname '*.log' \\) | head -80" in /home1/sota/inha2026
+ succeeded in 53ms:
+./logs/infer_baseline_v1_27431.out
+./logs/infer_baseline_v1_27437.out
+./logs/infer_baseline_v1_27438.out
+./logs/infer_baseline_v1_27440.out
+./logs/infer_baseline_v1_27625.out
+./logs/infer_baseline_v1_27626.out
+./logs/infer_baseline_v1_27627.out
+./logs/csv_baseline_v1_27628.out
+./logs/csv_baseline_ddim50_27629.out
+./logs/phase1_train_27630.out
+./logs/phase1_train_27633.out
+./logs/phase1_infer_27634.out
+./logs/phase1_csv_27635.out
+./logs/a1_infer_27646.out
+./logs/a1_csv_27647.out
+./logs/skel_train_27714.out
+./logs/skel_train_27716.out
+./logs/skel_train_27718.out
+./logs/skel_train_27719.out
+./logs/skel_train_27722.out
+./logs/skel_infer_1.5_27736.out
+./logs/skel_csv_1.5_27737.out
+./logs/skel_infer_1.5_27738.out
+./logs/skel_csv_1.5_27739.out
+./logs/infer_cfg2.0_27773.out
+./logs/infer_cfg3.0_27774.out
+./logs/csv_cfg2.0_27781.out
+./logs/csv_cfg3.0_27782.out
+./logs/predict_captions_27790.out
+./logs/csv_cfg2.0_27793.out
+./logs/csv_cfg3.0_27794.out
+./logs/predict_captions_27797.out
+./logs/predict_captions_27798.out
+./logs/predict_captions_27799.out
+./logs/predict_captions_27800.out
+./logs/predict_captions_27802.out
+./logs/predict_captions_27804.out
+./logs/irasim_so100_27888.log
+./logs/irasim_so100_27889.log
+./logs/irasim_so100_27892.log
+./logs/irasim_so100_27898.log
+./logs/irasim_so100_27899.log
+./logs/irasim_so100_27902.log
+./logs/irasim_so100_27904.log
+./logs/irasim_so100_27906.log
+./logs/irasim_so100_27908.log
+./logs/irasim_so100_27909.log
+./logs/irasim_so100_27910.log
+./logs/irasim_so100_27911.log
+./logs/irasim_so100_27912.log
+./logs/irasim_so100_27915.log
+./logs/irasim_so100_27916.log
+./logs/irasim_so100_27925.log
+./logs/irasim_infer_28060.log
+./logs/irasim_infer_28061.log
+./logs/irasim_infer_28062.log
+./logs/irasim_infer_28063.log
+./logs/irasim_csv_28064.log
+./logs/irasim_xl2_28065.log
+./logs/irasim_xl2_28066.log
+./logs/irasim_xl2_28067.log
+./logs/irasim_xl2_28068.log
+./logs/infer_xl2_pt_28070.log
+./logs/infer_xl2_pt_28072.log
+./logs/infer_xl2_2k_28110.log
+./logs/infer_xl2_2k_28111.log
+./logs/infer_xl2_2k_28113.log
+./logs/lora_train_28134.out
+./logs/lora_train_28135.out
+./logs/lora_train_28136.out
+./logs/infer_a1_evalstats_28137.log
+./logs/dreamzero_test_28141.log
+./logs/dreamzero_test_28142.log
+./logs/csv_a1_eval_28143.log
+./logs/dreamzero_test_28144.log
+./logs/lora_2k_infer_28145.log
+./logs/lora_4k_infer_28148.log
+./logs/lora_4k_infer_28154.log
+./logs/csv_lora_4k_28158.log
+./logs/dreamzero_test_28159.log
+
+exec
+/bin/bash -lc "pwd; rg --files | rg 'finetune_cosmos3_nano|codex_(predict25|extreme_v2|pivot_tick40)|30758|b4sw|w0075' | head -100; squeue -j 30758 -o '%.18i %.9P %.20j %.8T %.10M %.10L %.6D %R' 2>/dev/null || true" in /home1/sota/inha2026
+ succeeded in 58ms:
+exec
+/bin/bash -lc "sed -n '520,590p' scripts/finetune_cosmos3_nano.py; rg -n -C 3 'Predict2.5|시작 금지|검증|학습|rank 128|LoRA|buffer|버퍼|0\\.237|0\\.241' docs/plans/fresh_restart/codex_predict25_plan.txt docs/plans/fresh_restart/codex_extreme_v2_plan.txt docs/plans/fresh_restart/codex_pivot_tick40.txt; tail -80 logs/fresh/b4sw_bw_w0075_30758.err; sed -n '1,220p' fresh/scripts/b4sw_bw_w0075.sbatch" in /home1/sota/inha2026
+ succeeded in 0ms:
+                    help="Latent motion loss 가중치. 0=비활성. 권장 시작 0.5")
+    ap.add_argument("--motion-no-damp", action="store_true",
+                    help="motion loss에 (1-σ)^0.5 감쇠 미적용")
+    # 시드. 미지정(None)이면 기존과 동일하게 시드 없음 — 실행 간 잡음 측정(G2)을 위해 기본값을 바꾸지 않는다.
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--resume", type=str, default=None, help="이어서 학습할 체크포인트 (rank가 같아야 함)")
+    ap.add_argument("--action-repr", type=str, default="absolute", choices=ACTION_REPRS,
+                    help="action 표현. Cosmos3 공식 규약은 delta (기술보고서: flange-pose deltas). "
+                         "geom_v3는 빈 54채널에 절대 기하를 채운 37D")
+    args = ap.parse_args()
+
+    global ACTION_REPR, VERBOSE_FIRST_STEP
+    ACTION_REPR = args.action_repr
+    VERBOSE_FIRST_STEP = args.smoke_test
+    print(f"action 표현: {ACTION_REPR}")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    pipe = Cosmos3OmniPipeline.from_pretrained(MODEL_ID, torch_dtype=dtype, enable_safety_checker=False)
+    pipe.to(device)
+    transformer = pipe.transformer
+    transformer.requires_grad_(False)
+    transformer.enable_gradient_checkpointing()
+
+    lora_config = LoraConfig(
+        r=args.rank, lora_alpha=args.rank, target_modules=LORA_TARGET_MODULES, init_lora_weights="gaussian",
+    )
+    transformer.add_adapter(lora_config)
+    lora_params = [p for n, p in transformer.named_parameters() if "lora_" in n]
+    # FREEZE_LORA=1 → LoRA freeze, action_proj만 학습 (native path full fine-tune)
+    freeze_lora = os.environ.get("FREEZE_LORA", "0") == "1"
+    for p in lora_params:
+        p.requires_grad_(not freeze_lora)
+    if freeze_lora:
+        print(f"[FREEZE_LORA=1] LoRA 파라미터 {len(lora_params)}개 freeze — action_proj/embed만 학습", flush=True)
+
+    transformer.action_proj_in.requires_grad_(True)
+    transformer.action_proj_out.requires_grad_(True)
+    transformer.action_modality_embed.requires_grad_(True)
+    proj_params = list(transformer.action_proj_in.parameters()) + list(transformer.action_proj_out.parameters()) + [transformer.action_modality_embed]
+
+    if args.resume:
+        ck = torch.load(args.resume, map_location=device)
+        sd = transformer.state_dict()
+        n_loaded = 0
+        for k, v in ck["lora"].items():
+            if k in sd:
+                sd[k] = v.to(device=device, dtype=sd[k].dtype)
+                n_loaded += 1
+        transformer.load_state_dict(sd, strict=False)
+        transformer.action_proj_in.load_state_dict(ck["action_proj_in"])
+        transformer.action_proj_out.load_state_dict(ck["action_proj_out"])
+        with torch.no_grad():
+            transformer.action_modality_embed.copy_(ck["action_modality_embed"].to(device))
+        print(f"이어서 학습: {Path(args.resume).name} (step={ck['step']}, LoRA {n_loaded}/{len(ck['lora'])}개 로드)")
+        if n_loaded != len(ck["lora"]):
+            raise RuntimeError(f"LoRA 텐서 불일치 — rank가 체크포인트와 다른지 확인 ({n_loaded}/{len(ck['lora'])})")
+
+    n_lora = sum(p.numel() for p in lora_params)
+    n_proj = sum(p.numel() for p in proj_params)
+    print(f"Trainable: LoRA={n_lora/1e6:.2f}M  action_proj/embed={n_proj/1e6:.2f}M")
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": lora_params, "lr": args.lr},
+            {"params": proj_params, "lr": args.lr * args.proj_lr_mult},
+        ]
+    )
+
+docs/plans/fresh_restart/codex_pivot_tick40.txt-115-        "ckpt_step004000.pt": {
+docs/plans/fresh_restart/codex_pivot_tick40.txt-116-          "mean": 0.38025443592212266,
+docs/plans/fresh_restart/codex_pivot_tick40.txt-117-          "median": 0.35207299888134,
+docs/plans/fresh_restart/codex_pivot_tick40.txt:118:          "predicted_lb": 0.24110177436884908
+docs/plans/fresh_restart/codex_pivot_tick40.txt-119-        },
+docs/plans/fresh_restart/codex_pivot_tick40.txt-120-        "ckpt_step006000.pt": {
+docs/plans/fresh_restart/codex_pivot_tick40.txt-121-          "mean": 0.3775130001724594,
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-264-1. 이 pivot 시점에서 다음 후보 우선순위?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-265-2. 현재 결과 중 개선 신호 있는가 (Action + Visual 종합)?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-266-3. 실측 slot 사용할 만한 candidate?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:267:4. 다음 학습 launch 권장? 어떤 것?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-268-5. 마감 안전 관점에서 위험한 시도가 있는가?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-269-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-270-brutally honest. 이전 자문 (`codex_break_b4.txt`, `codex_plan_review.txt`, `codex_log_review.txt`)의 조언 재확인. 짧게 (300 words 이내).
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-287-session id: 01a01526-89b6-7e11-84a4-a0b73292dbf2
+docs/plans/fresh_restart/codex_pivot_tick40.txt-288---------
+docs/plans/fresh_restart/codex_pivot_tick40.txt-289-user
+docs/plans/fresh_restart/codex_pivot_tick40.txt:290:CONTEXT: 2026 인하 AI 챌린지, Cosmos3-Nano LoRA fine-tune. Kit GRU 채점 규정 위반 (자체 predictor만 허용). 시간 무제한.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-291-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-292-## 실측 결과 (모두 v5b_ANCHORED_soft 40k base + 다양한 fine-tune)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-293-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-295-|---|---|---|---|---|
+docs/plans/fresh_restart/codex_pivot_tick40.txt-296-| v5b_ANCH (안전본) | 0.3886 | **0.24524** | - | 40k step |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-297-| **B4 step6k** | 0.3798 | **0.2407** | 0.2409 | ⭐ 도전본. E invdyn L1 w=(1-σ)·0.05, effective≈0.005 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:298:| Z6 step2k | 0.3813 | - | 0.2415 | Bounded adapter α_max=0.08 + preserve loss |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:299:| NAP step8k | 0.3819 | - | 0.2418 | LoRA freeze, action_proj_in/out만 학습 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-300-| Z5 step5k | 0.3970 | - | 0.2478 | Shuffled ranking + cross-attn adapter (no bounded) |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-301-| B4v2 step4k | 0.3735 | **0.2508** | 0.2384 | Weight 0.15 constant → visual 0.089→0.101 손상 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-302-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-305-- E invdyn(우리 자체) vs kit GRU 부호 반전 (판독기 v2에서 확인)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-306-- Multi-loss balance 부재
+docs/plans/fresh_restart/codex_pivot_tick40.txt-307-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:308:## 새 후보 (설계 검증 필요)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-309-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-310-### 후보 1: Z6-B4 hybrid
+docs/plans/fresh_restart/codex_pivot_tick40.txt-311-```
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-318-- B4 안정 weight scheme (visual 유지 확인)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-319-- Z6 preserve loss (visual 손상 방지)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-320-- Bounded 구조로 무제한 성장 방지
+docs/plans/fresh_restart/codex_pivot_tick40.txt:321:- 15k = 1.4 epoch로 안정 학습
+docs/plans/fresh_restart/codex_pivot_tick40.txt-322-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-323-### 후보 2: B4 longer + weight schedule
+docs/plans/fresh_restart/codex_pivot_tick40.txt-324-```
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-326-Weight schedule: 0-5k(0.02) → 5-15k(0.05) → 15k+(0.10)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-327-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-328-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:329:### 후보 3: NAP + LoRA 병행
+docs/plans/fresh_restart/codex_pivot_tick40.txt-330-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt:331:FREEZE_LORA=0, LoRA + action_proj 함께 학습
+docs/plans/fresh_restart/codex_pivot_tick40.txt-332-NAP 방식은 유지 (action_proj 강조)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-333-20k step
+docs/plans/fresh_restart/codex_pivot_tick40.txt-334-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-335-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-336-## 물음 (brutally honest)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-337-1. Z6-B4 hybrid가 B4를 이길 확률? (Codex 30% 문턱)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:338:2. B4 6k에서 optimal이었나 아니면 학습 부족?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:339:3. 후보 3 (NAP+LoRA)이 v5b 원본 학습과 실질 차이 있나?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:340:4. 이 시점에서 근본적으로 다른 접근 (RAFT/DPO/RL, latent-space IDM 재학습, 새 backbone 등)이 실질 upside 있나?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-341-5. **B4 초월 확률 30% 이상** 방식 순위. 시간 무제한.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-342-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-343-warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-344-codex
+docs/plans/fresh_restart/codex_pivot_tick40.txt:345:주어진 실측을 중심으로 판단하되, 대회 규정과 모델 구조에 관해 공개적으로 확인 가능한 내용도 교차검증하겠습니다. 핵심은 예상 LB 회귀식이 B4v2에서 크게 깨졌다는 점까지 포함해 확률을 보수적으로 다시 잡는 것입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-346-web search: 
+docs/plans/fresh_restart/codex_pivot_tick40.txt:347:web search: 2026 인하 AI 챌린지 Cosmos3-Nano LoRA GRU 채점 규정 ...
+docs/plans/fresh_restart/codex_pivot_tick40.txt-348-codex
+docs/plans/fresh_restart/codex_pivot_tick40.txt:349:냉정한 결론부터 말하면, **현재 제시한 단일 레시피 중 B4 초월 확률이 확실히 30%를 넘는 것은 없습니다.** 다만 여러 체크포인트를 생성해 자체 검증으로 고르는 “B4 continuation sweep”은 30%를 넘길 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-350-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-351-가장 중요한 사실은 B4v2입니다. 예상 0.2384가 실측 0.2508로 무너졌으므로, 현재 예상 LB 모델은 **좋은 영역 밖에서 순위를 판별하지 못합니다.** Action mean 역시 0.3798→0.3735로 좋아 보였지만 실제 LB는 악화했습니다. 따라서 이후 확률은 예상 LB보다 “B4에서 얼마나 작은 변화인가”에 더 큰 가중치를 둬야 합니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-352-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-354-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-355-제 추정은:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-356-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:357:- 제시안 그대로 15k 한 번 학습: **25~35%, 중앙값 30%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-358-- seed 하나, 마지막 체크포인트만 제출: **약 25%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt:359:- 2k 간격 체크포인트 + 엄격한 자체 검증 선택: **35~45%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-360-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-361-즉 “30% 문턱”에 딱 걸친 후보이지, 확실한 우위 후보는 아닙니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-362-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-371-- `α_max=0.05`는 adapter 계수만 제한하지 **전체 representation drift를 제한하지 않습니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-372-- preserve loss 0.10의 절대 효과는 loss 단위와 gradient norm을 모르면 판단할 수 없습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-373-- RMS normalization은 안정화 장치인 동시에 B4에서 성공했던 미세한 gradient 비율을 바꿀 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:374:- adapter + preserve + RMS + weight decay + 장기학습을 동시에 바꾸므로 실패 시 원인을 알 수 없습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:375:- 자체 E-invdyn과 숨은 GRU의 방향이 실제로 반대라면, 더 안정적으로 오래 학습하는 것이 오히려 더 안정적으로 잘못된 방향으로 가는 셈입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-376-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-377-따라서 첫 실험은 hybrid 전체가 아니라:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-378-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-382-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-383-순으로 해야 합니다. RMS normalization은 그다음입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-384-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:385:## 2. B4 6k가 optimal이었나, 학습 부족인가
+docs/plans/fresh_restart/codex_pivot_tick40.txt-386-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:387:현재 증거로는 **“학습 부족”보다 “초기 sweet spot”일 가능성이 큽니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-388-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-389-제 주관 확률:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-390-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-392-- 6k 이후 8~12k에서 추가 개선: **30%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-393-- 15k 이상에서 의미 있는 추가 개선: **15%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-394-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:395:B4의 action weight는 effective 약 0.005입니다. 이 정도면 학습 속도는 느리지만, 40k base 위에서 하는 fine-tune이므로 “1.4 epoch가 필요하다”는 논리는 약합니다. 중요한 것은 epoch 수가 아니라 **base로부터의 이동 거리**입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-396-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-397-후보 2의 스케줄은 권하지 않습니다. 15k 이후 0.10은 B4v2의 실패 방향으로 접근합니다. 특히 `σ`까지 곱해지더라도 장기간 누적 drift가 생깁니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-398-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-407-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-408-즉 increasing schedule이 아니라 **flat/decaying schedule**이 더 타당합니다. 7k, 8k, 10k, 12k, 15k를 모두 저장하세요. 시간 무제한이라도 20k endpoint 하나에 거는 것은 정보 낭비입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-409-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:410:## 3. NAP + LoRA는 v5b 원본과 실질적으로 다른가
+docs/plans/fresh_restart/codex_pivot_tick40.txt-411-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-412-대체로 **큰 차이가 없을 가능성이 높습니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-413-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:414:`FREEZE_LORA=0`으로 LoRA와 `action_proj_in/out`을 함께 학습한다면, 다음 중 하나가 없다면 본질적으로 v5b식 joint fine-tuning입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-415-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-416-- action projection에 별도 learning rate
+docs/plans/fresh_restart/codex_pivot_tick40.txt-417-- 별도 optimizer group/weight decay
+docs/plans/fresh_restart/codex_pivot_tick40.txt-418-- projection gradient amplification
+docs/plans/fresh_restart/codex_pivot_tick40.txt:419:- LoRA에 훨씬 작은 LR
+docs/plans/fresh_restart/codex_pivot_tick40.txt-420-- update-norm budget 또는 trust region
+docs/plans/fresh_restart/codex_pivot_tick40.txt:421:- 일정 기간 projection-only warm-up 후 LoRA 해제
+docs/plans/fresh_restart/codex_pivot_tick40.txt-422-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-423-단순히 “action_proj를 강조한다”가 loss graph나 optimizer update에 반영되지 않으면 이름만 NAP입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-424-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-426-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-427-```text
+docs/plans/fresh_restart/codex_pivot_tick40.txt-428-action_proj LR = 1.0×
+docs/plans/fresh_restart/codex_pivot_tick40.txt:429:LoRA LR = 0.1~0.2×
+docs/plans/fresh_restart/codex_pivot_tick40.txt-430-처음 2k: action_proj only
+docs/plans/fresh_restart/codex_pivot_tick40.txt:431:이후 LoRA unfreeze
+docs/plans/fresh_restart/codex_pivot_tick40.txt:432:LoRA update norm을 B4 대비 일정 범위로 제한
+docs/plans/fresh_restart/codex_pivot_tick40.txt-433-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-434-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-435-그래도 action_proj는 작은 인터페이스에 모든 보정을 몰아넣기 때문에 과적합하기 쉽습니다. 후보 3 단독의 B4 초월 확률은 **15~25%**로 봅니다.
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-443-RAFT/DPO/RL은 좋은 reward 또는 preference oracle이 있을 때 강합니다. 지금은 자체 E-invdyn과 숨은 채점기가 어긋난다는 증거가 있으므로, RL은 그 proxy를 더 강하게 해킹할 가능성이 큽니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-444-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-445-- 현재 predictor 그대로 사용: B4 초월 확률 **10~20%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt:446:- LB와 높은 상관이 검증된 새 reward가 생긴 뒤 사용: **30%+ 가능**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-447-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-448-즉 알고리즘이 아니라 reward가 병목입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-449-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:450:### latent-space IDM 재학습
+docs/plans/fresh_restart/codex_pivot_tick40.txt-451-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-452-근본 접근 중에는 **가장 실질적인 upside**가 있습니다. 단, predictor를 강하게 만드는 것이 아니라 “일반화되는 predictor”를 만드는 것이 핵심입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-453-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-454-권장 조건:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-455-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:456:- 생성 모델 학습 샘플과 IDM 학습 샘플을 분리
+docs/plans/fresh_restart/codex_pivot_tick40.txt-457-- trajectory/group 단위 cross-validation
+docs/plans/fresh_restart/codex_pivot_tick40.txt-458-- frame shortcut을 막는 augmentation
+docs/plans/fresh_restart/codex_pivot_tick40.txt-459-- 여러 temporal stride 사용
+docs/plans/fresh_restart/codex_pivot_tick40.txt-460-- 여러 seed/architecture IDM ensemble
+docs/plans/fresh_restart/codex_pivot_tick40.txt-461-- ensemble disagreement가 큰 샘플은 reward 약화
+docs/plans/fresh_restart/codex_pivot_tick40.txt:462:- 절대 action 회귀뿐 아니라 pairwise direction/ranking도 함께 검증
+docs/plans/fresh_restart/codex_pivot_tick40.txt-463-- predictor score가 아니라 held-out 실제 action recovery를 기준으로 선택
+docs/plans/fresh_restart/codex_pivot_tick40.txt-464-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:465:단일 IDM을 새로 학습해 곧바로 optimize하면 **20~30%**. Cross-fitted ensemble을 만들고 작은 trust-region fine-tune에 사용하면 **35~50%**까지 볼 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-466-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-467-### 새 backbone
+docs/plans/fresh_restart/codex_pivot_tick40.txt-468-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-469-추천하지 않습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-470-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:471:현재 B4가 이미 0.2407이고, backbone 변경은 데이터·학습 recipe·generation dynamics를 모두 다시 맞춰야 합니다. 시간 무제한이어도 제출/검증 신호가 제한된다면 탐색 효율이 너무 낮습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-472-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-473-- 단순 backbone 교체: **5~15%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-474-- 더 좋은 pretrained checkpoint가 task와 직접 일치: 예외적으로 가능
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-482-| 3 | Z6–B4 hybrid를 단계적으로 추가하고 checkpoint selection | **35~45%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-483-| 4 | 제시한 Z6–B4 hybrid를 그대로 15k 단발 실행 | **25~35%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-484-| 5 | B4 longer, 단 weight flat/decay | **25~35%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:485:| 6 | NAP + differential LR + delayed LoRA unfreeze | **20~30%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-486-| 7 | 제시한 increasing-weight B4 20k | **15~25%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:487:| 8 | 단순 NAP + LoRA 병행 | **15~25%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-488-| 9 | 현 predictor 기반 RAFT/DPO/RL | **10~20%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-489-| 10 | 새 backbone | **5~15%** |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-490-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-500-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-501-을 권합니다. 전 조합을 돌릴 필요는 없고, 먼저 한 요소씩 확인한 뒤 살아남은 조합만 합치면 됩니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-502-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:503:한 문장으로 요약하면: **B4는 아직 덜 학습된 모델이라기보다, 잘못 정렬된 보조 목적을 아주 약하게 적용해서 우연히 좋은 지점에 멈춘 모델일 가능성이 높습니다. 따라서 더 세게·더 오래보다, B4 근방을 촘촘히 탐색하는 것이 유일하게 30%를 안정적으로 넘길 전략입니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-504-tokens used
+docs/plans/fresh_restart/codex_pivot_tick40.txt-505-10,690
+docs/plans/fresh_restart/codex_pivot_tick40.txt:506:냉정한 결론부터 말하면, **현재 제시한 단일 레시피 중 B4 초월 확률이 확실히 30%를 넘는 것은 없습니다.** 다만 여러 체크포인트를 생성해 자체 검증으로 고르는 “B4 continuation sweep”은 30%를 넘길 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-507-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-508-가장 중요한 사실은 B4v2입니다. 예상 0.2384가 실측 0.2508로 무너졌으므로, 현재 예상 LB 모델은 **좋은 영역 밖에서 순위를 판별하지 못합니다.** Action mean 역시 0.3798→0.3735로 좋아 보였지만 실제 LB는 악화했습니다. 따라서 이후 확률은 예상 LB보다 “B4에서 얼마나 작은 변화인가”에 더 큰 가중치를 둬야 합니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-509-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-511-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-512-제 추정은:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-513-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:514:- 제시안 그대로 15k 한 번 학습: **25~35%, 중앙값 30%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-515-- seed 하나, 마지막 체크포인트만 제출: **약 25%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt:516:- 2k 간격 체크포인트 + 엄격한 자체 검증 선택: **35~45%**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-517-Reading prompt from stdin...
+docs/plans/fresh_restart/codex_pivot_tick40.txt-518-OpenAI Codex v0.147.0
+docs/plans/fresh_restart/codex_pivot_tick40.txt-519---------
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-527-session id: 01a0171f-8596-7872-9328-63501d0dbca5
+docs/plans/fresh_restart/codex_pivot_tick40.txt-528---------
+docs/plans/fresh_restart/codex_pivot_tick40.txt-529-user
+docs/plans/fresh_restart/codex_pivot_tick40.txt:530:CONTEXT: 인하 AI 챌린지 D-1 (마감 08-20 18:00 KST, 남은 ~28h). Cosmos3-Nano LoRA fine-tune.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-531-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:532:## 이전 Codex 자문 실측 검증 (D-2 이후)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-533-Codex Z6 → Z6-B4 hybrid launch → 실측 LB 0.2499 (Codex 예언 정확: "다중 변경 실패")
+docs/plans/fresh_restart/codex_pivot_tick40.txt-534-Codex "B4 근방 촘촘 탐색" 권장 → 현재 sweep chain 진행
+docs/plans/fresh_restart/codex_pivot_tick40.txt-535-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-570-4. 이 시점 (D-1, ~28h 남음)에 우선순위는?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-571-   - A. Sweep 완료 대기 → 최선 pick → 실측 slot
+docs/plans/fresh_restart/codex_pivot_tick40.txt-572-   - B. Sweep과 magweight 병행 (Blackwell 순차라 실제 병행 X)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:573:   - C. 새 접근 (예: E invdyn ensemble 학습) 시도
+docs/plans/fresh_restart/codex_pivot_tick40.txt-574-5. B4 sweep에서 개선 없을 시 **다음 pivot 순위**?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-575-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-576-### 로그 파일 검토 부탁 (경로 read-only 접근 가능)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-577-- `/home1/sota/inha2026/logs/fresh/auto_loop.log` — auto loop 최신 tick
+docs/plans/fresh_restart/codex_pivot_tick40.txt-578-- `/home1/sota/inha2026/logs/fresh/orchestrator_state.json` — candidate 상태
+docs/plans/fresh_restart/codex_pivot_tick40.txt:579:- `/home1/sota/inha2026/checkpoints/z6b4_hybrid/z6_train.jsonl` — Z6-B4 hybrid 학습 dynamics (실패 케이스)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:580:- `/home1/sota/inha2026/checkpoints/v5b_eloss_bw/*.log` 혹은 관련 — B4 학습 로그
+docs/plans/fresh_restart/codex_pivot_tick40.txt-581-- 이 로그들에서 문제/기회 감지?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-582-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-583-### Action-magnitude weighting 대안
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-589-### D-day 마감 안전 전략
+docs/plans/fresh_restart/codex_pivot_tick40.txt-590-- 안전본 v5b_ANCH (0.24524) + 도전본 B4 (0.2407) 최소 확정
+docs/plans/fresh_restart/codex_pivot_tick40.txt-591-- 남은 시간 30% 개선 확률 승부 vs 여유 유지 트레이드오프?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:592:- 마지막 6-10h는 무조건 검증/제출 buffer 유지 권장?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-593-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:594:로그 파일 열람 후 실제 학습 dynamics 분석 필요. 이전 Codex 자문 (`codex_break_b4.txt`, `codex_z6.txt`)도 참고 가능.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-595-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-596-brutally honest 부탁.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-597-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-598-warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-599-codex
+docs/plans/fresh_restart/codex_pivot_tick40.txt:600:요청하신 로그와 이전 자문을 직접 대조해 보겠습니다. 우선 파일 크기·최신 상태·학습 곡선을 읽고, “희망적 가능성”과 “마감 내 실제 기대값”을 분리해서 판단하겠습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-601-codex
+docs/plans/fresh_restart/codex_pivot_tick40.txt-602-첫 셸 호출이 컨테이너의 loopback 설정 권한 문제로 실행 전 차단됐습니다. 네트워크가 필요 없는 읽기 작업이므로 로그인 셸을 끄고 다시 열람하겠습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-603-codex
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-611-- `w=0.05`를 최우선으로 두고 **4k/6k/8k/10k/12k checkpoint 중 선택**해야 합니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-612-- 현재 magweight 구현은 그대로라면 취소 또는 후순위가 맞습니다. 특히 **motion weight로 전체 flow loss까지 곱하는 것은 위험**합니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-613-- E/invdyn 같은 새 계열은 지금 시작하지 마십시오.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:614:- 마감 전 **최소 8시간**, 가능하면 10시간을 inference·CSV 검증·재제출 buffer로 남기십시오.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-615-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-616-현재 chain을 그대로 15–20시간 돌리면 남는 8–13시간 중 장애 한 번으로 제출 안전성이 무너집니다. 저는 **30756 magweight를 빼는 쪽**에 가깝습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-617-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-622-| 후보 | 개선 확률 | 판단 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-623-|---|---:|---|
+docs/plans/fresh_restart/codex_pivot_tick40.txt-624-| `w=0.025, 12k` | 10–20% | action supervision이 약해져 B4 이득이 희석될 가능성 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:625:| `w=0.05, 12k` | 20–30% | 동일 basin 재현 가능성이 가장 높지만, 6k보다 과학습 위험 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-626-| `w=0.075, 12k` | 10–20% | action fitting 증가 대신 visual/flow 손상 위험 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-627-| 셋 중 하나라도 개선 | 30–40% | 실험들이 강하게 상관되어 독립 확률로 계산하면 안 됨 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-628-| 의미 있는 개선, 예: `<0.238` | 10–15% | 국소 sweep의 기대 개선 폭은 보통 작음 |
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-669-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-670-1. 전체 loss에 적용됨
+docs/plans/fresh_restart/codex_pivot_tick40.txt-671-2. weight 평균이 1로 보장되지 않음
+docs/plans/fresh_restart/codex_pivot_tick40.txt:672:3. motion magnitude가 실제 LB error의 원인이라는 검증이 아직 없음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-673-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-674-권장 범위:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-675-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-691-3. 가능하면 6k/8k/12k checkpoint 비교
+docs/plans/fresh_restart/codex_pivot_tick40.txt-692-4. `w=0.075`는 시간 여유가 있을 때만
+docs/plans/fresh_restart/codex_pivot_tick40.txt-693-5. magweight는 취소하거나 최종 저비용 lottery ticket으로만
+docs/plans/fresh_restart/codex_pivot_tick40.txt:694:6. E/invdyn 신규 학습은 하지 않음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-695-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-696-현재 순서가 바뀔 수 있다면:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-697-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-768-session id: 01a01729-45ca-7161-8f66-e19669e5fc44
+docs/plans/fresh_restart/codex_pivot_tick40.txt-769---------
+docs/plans/fresh_restart/codex_pivot_tick40.txt-770-user
+docs/plans/fresh_restart/codex_pivot_tick40.txt:771:CONTEXT: 인하 AI 챌린지 D-1, Cosmos3-Nano LoRA fine-tune. 아래에 실제 로그를 embed. 이전 자문(`codex_break_b4.txt`, `codex_plan_review.txt`)에서 sandbox loopback 오류로 로그 못 읽었으니 여기서 직접 검토 부탁.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-772-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-773-## 실측 확정
+docs/plans/fresh_restart/codex_pivot_tick40.txt-774-- v5b_ANCH: 0.24524
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-813-[2026-08-19T07:36:24] [z6b4_hybrid_v2] error: 'ckpt_dir'
+docs/plans/fresh_restart/codex_pivot_tick40.txt-814-[2026-08-19T07:36:24] [nap_plus_lora] error: 'ckpt_dir'
+docs/plans/fresh_restart/codex_pivot_tick40.txt-815-[2026-08-19T07:46:24] --- tick 54 ---
+docs/plans/fresh_restart/codex_pivot_tick40.txt:816:[2026-08-19T07:46:25] [z6b4_hybrid] z6_step004000.pt: Action mean=0.3813 pred_LB=0.2415
+docs/plans/fresh_restart/codex_pivot_tick40.txt:817:[2026-08-19T07:46:25] [z6b4_hybrid] z6_step008000.pt: Action mean=0.3812 pred_LB=0.2415
+docs/plans/fresh_restart/codex_pivot_tick40.txt:818:[2026-08-19T07:46:26] [z6b4_hybrid] z6_step012000.pt: Action mean=0.3819 pred_LB=0.2418
+docs/plans/fresh_restart/codex_pivot_tick40.txt-819-[2026-08-19T07:46:26] [z6b4_hybrid] z6_step015000.pt: Action mean=0.3780 pred_LB=0.2402
+docs/plans/fresh_restart/codex_pivot_tick40.txt-820-[2026-08-19T07:46:26] [z6b4_hybrid] marginal (better than B4 but > 0.375)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-821-[2026-08-19T07:46:26] [b4_longer] no ckpts yet
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-881-  "codex_consultations": []
+docs/plans/fresh_restart/codex_pivot_tick40.txt-882-}```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-883-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:884:## Z6-B4 hybrid 학습 dynamics 요약 (train.jsonl → 500 step 단위 residual)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-885-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-886-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-887-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:888:## B4 원본 학습 dynamics (logs/fresh/b4bw_30632.log — 6k step, 결과 LB 0.2407)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-889-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-890-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-891-
+docs/plans/fresh_restart/codex_pivot_tick40.txt:892:## B4v2 학습 dynamics (실패 케이스, LB 0.2508)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-893-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-894-```
+docs/plans/fresh_restart/codex_pivot_tick40.txt-895-
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-900-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-901-## 물음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-902-위 실제 로그 검토 후:
+docs/plans/fresh_restart/codex_pivot_tick40.txt:903:1. Z6-B4 hybrid 학습에서 residual/preserve/action loss 패턴 중 visual 손상 조기 신호가 보이는가? 언제부터 위험 지점 진입?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:904:2. B4 원본 학습 (성공 0.2407)과 B4v2 (실패 0.2508)의 학습 dynamics 차이 중 결정적 지표?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-905-3. 현재 진행 중 B4 sweep w=0.025 (30749) 초기 step에서 이상 신호 감지? 계속 진행 가치?
+docs/plans/fresh_restart/codex_pivot_tick40.txt:906:4. 로그 기반으로 Codex 이전 자문 (`checkpoint_selection > single 12k`) 재검증?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-907-5. 로그에서 발견한 다른 통찰?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-908-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-909-이전 조언 (`codex_plan_review.txt` 결론):
+docs/plans/fresh_restart/codex_pivot_tick40.txt-910-- w=0.05 우선, w=0.025/0.075는 확률 낮음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-911-- Magweight 취소 권고
+docs/plans/fresh_restart/codex_pivot_tick40.txt:912:- 마감 10h buffer 유지
+docs/plans/fresh_restart/codex_pivot_tick40.txt-913-- Pivot: B4 checkpoint selection > seed reproduction > blend > action-only mild > stratified > E/invdyn
+docs/plans/fresh_restart/codex_pivot_tick40.txt-914-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-915-로그 데이터가 이 조언을 지지/반박?
+docs/plans/fresh_restart/codex_pivot_tick40.txt-916-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-917-codex
+docs/plans/fresh_restart/codex_pivot_tick40.txt:918:빈 코드블록으로 빠진 학습 dynamics는 워크스페이스의 원본 로그에서 직접 복원해 비교하겠습니다. 우선 관련 로그·설정·이전 자문을 읽고, 동일 step 구간의 loss를 정규화해 성공/실패 런과 현재 sweep을 대조하겠습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-919-exec
+docs/plans/fresh_restart/codex_pivot_tick40.txt-920-/bin/bash -lc "pwd && rg --files | rg '("'^|/)(codex_break_b4'"\\.txt|codex_plan_review\\.txt|auto_loop\\.log|orchestrator_state\\.json|train\\.jsonl|b4bw_30632\\.log)|30749|b4v2|z6.*b4|hybrid' | head -300" in /home1/sota/inha2026
+docs/plans/fresh_restart/codex_pivot_tick40.txt-921- succeeded in 0ms:
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-999-docs/plans/fresh_restart/codex_pivot_tick8.txt:945:docs/plans/fresh_restart/codex_z6.txt:19:- **B4v2 (weight fix: constant 0.15, 4k step)**: Action 0.3735 하지만 LB 0.2508 (**visual term 0.089→0.101 손상**, +0.0056 악화)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1000-docs/plans/fresh_restart/codex_pivot_tick8.txt:946:docs/plans/fresh_restart/codex_z6.txt:30:2. Residual 무한 성장 — regularizer 없어 adapter가 base v5b visual 지식 훼손
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1001-docs/plans/fresh_restart/codex_pivot_tick8.txt:947:docs/plans/fresh_restart/codex_z6.txt:37:   - L = w1·L_flow + w2·L_action + w3·L_visual
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1002:docs/plans/fresh_restart/codex_pivot_tick8.txt:948:docs/plans/fresh_restart/codex_z6.txt:38:   - L_visual: 우리 자체 학습 R3D-equivalent (train video only) 사용
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1003-docs/plans/fresh_restart/codex_pivot_tick8.txt:949:docs/plans/fresh_restart/codex_z6.txt:58:3. **Action-video tradeoff 상한** (Action 낮추면 visual 반드시 손상되는 것)을 근본적으로 해결하는 방법이 있나? 
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1004-docs/plans/fresh_restart/codex_pivot_tick8.txt:950:docs/plans/fresh_restart/codex_z6.txt:94:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1005-docs/plans/fresh_restart/codex_pivot_tick8.txt:951:docs/plans/fresh_restart/codex_z6.txt:104:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1006:docs/plans/fresh_restart/codex_pivot_tick8.txt:952:docs/plans/fresh_restart/codex_z6.txt:105:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1007-docs/plans/fresh_restart/codex_pivot_tick8.txt:953:docs/plans/fresh_restart/codex_z6.txt:116:- `Δ visual preservation`
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1008-docs/plans/fresh_restart/codex_pivot_tick8.txt:954:docs/plans/fresh_restart/codex_z6.txt:166:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1009-docs/plans/fresh_restart/codex_pivot_tick8.txt:955:docs/plans/fresh_restart/codex_z6.txt:185:\cos(g_{\rm action}, g_{\rm visual}),\quad
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1014-docs/plans/fresh_restart/codex_pivot_tick8.txt:960:docs/plans/fresh_restart/codex_z6.txt:366:- action/visual gradient cosine이 심하게 음수가 아님
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1015-docs/plans/fresh_restart/codex_pivot_tick8.txt:961:docs/plans/fresh_restart/codex_z6.txt:411:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1016-docs/plans/fresh_restart/codex_pivot_tick8.txt:962:docs/plans/fresh_restart/codex_z6.txt:421:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1017:docs/plans/fresh_restart/codex_pivot_tick8.txt:963:docs/plans/fresh_restart/codex_z6.txt:422:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1018-docs/plans/fresh_restart/codex_pivot_tick8.txt:964:docs/plans/fresh_restart/codex_z6.txt:433:- `Δ visual preservation`
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1019-docs/plans/fresh_restart/codex_pivot_tick8.txt:965:docs/plans/fresh_restart/codex_z6.txt:483:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1020-docs/plans/fresh_restart/codex_pivot_tick8.txt:966:docs/plans/fresh_restart/codex_z6.txt:502:\cos(g_{\rm action}, g_{\rm visual}),\quad
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1030-docs/plans/fresh_restart/codex_pivot_tick8.txt:976:docs/plans/fresh_restart/codex_z5.txt:162:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1031-docs/plans/fresh_restart/codex_pivot_tick8.txt:977:docs/plans/fresh_restart/codex_z5.txt:169:- `v_pred rel_l2`와 visual validation을 동시에
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1032-docs/plans/fresh_restart/codex_pivot_tick8.txt:978:docs/plans/fresh_restart/codex_z5.txt:238:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1033:docs/plans/fresh_restart/codex_pivot_tick8.txt:979:docs/plans/fresh_restart/codex_z5.txt:273:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1034-docs/plans/fresh_restart/codex_pivot_tick8.txt:980:docs/plans/fresh_restart/codex_z5.txt:275:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1035-docs/plans/fresh_restart/codex_pivot_tick8.txt:981:docs/plans/fresh_restart/codex_z5.txt:293:- visual rel-L2 악화 없음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1036-docs/plans/fresh_restart/codex_pivot_tick8.txt:982:docs/plans/fresh_restart/codex_z5.txt:564:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1039-docs/plans/fresh_restart/codex_pivot_tick8.txt:985:docs/plans/fresh_restart/codex_z5.txt:655:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1040-docs/plans/fresh_restart/codex_pivot_tick8.txt:986:docs/plans/fresh_restart/codex_z5.txt:662:- `v_pred rel_l2`와 visual validation을 동시에
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1041-docs/plans/fresh_restart/codex_pivot_tick8.txt:987:docs/plans/fresh_restart/codex_z5.txt:731:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1042:docs/plans/fresh_restart/codex_pivot_tick8.txt:988:docs/plans/fresh_restart/codex_z5.txt:766:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1043-docs/plans/fresh_restart/codex_pivot_tick8.txt:989:docs/plans/fresh_restart/codex_z5.txt:768:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1044-docs/plans/fresh_restart/codex_pivot_tick8.txt:990:docs/plans/fresh_restart/codex_z5.txt:786:- visual rel-L2 악화 없음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1045-docs/plans/fresh_restart/codex_pivot_tick8.txt:991:docs/plans/fresh_restart/codex_z5.txt:1057:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1046:docs/plans/fresh_restart/codex_pivot_tick8.txt:992:docs/plans/fresh_restart/codex_paper.txt:102:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1047:docs/plans/fresh_restart/codex_pivot_tick8.txt:993:docs/plans/fresh_restart/codex_paper.txt:317:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1048-docs/plans/fresh_restart/codex_pivot_tick8.txt:1003:docs/plans/fresh_restart/codex_v8.txt:175:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1049-docs/plans/fresh_restart/codex_pivot_tick8.txt:1004:docs/plans/fresh_restart/codex_v8.txt:400:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1050-docs/plans/fresh_restart/codex_pivot_tick8.txt:1009:docs/plans/fresh_restart/codex_v7.txt:217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1054-docs/plans/fresh_restart/codex_pivot_tick8.txt:1014:logs/fresh/z5inf5k_30690.log:79:vs B4v2_step4k: 0.3735 (LB 0.2508 - visual 손상!)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1055-docs/plans/fresh_restart/codex_pivot_tick8.txt:1015:logs/fresh/z5inf5k_30690.log:80:예상 LB (visual 유지 가정): 0.2478
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1056-docs/plans/fresh_restart/codex_pivot_tick8.txt:1018:logs/fresh/b4sw_bw_w0025_30749.log:79:step 001340/12000 loss=0.3839 flow=0.3785 action=0.4269 sigma=0.4939 motion=0.0000 avg=0.2058 elapsed=2384s
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1057:docs/plans/fresh_restart/codex_pivot_tick8.txt:1020:logs/fresh/z6inf2k_30720.log:77:예상 LB (v5b visual 유지 가정): 0.2415
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1058-docs/plans/fresh_restart/codex_pivot_tick8.txt:1023:냉정한 결론: **신호는 있지만, 아직 실측 확정급은 아닙니다. Action proxy 단독 신뢰는 이미 B4v2/Z6-B4가 반증했습니다.**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1059-docs/plans/fresh_restart/codex_pivot_tick8.txt:1029:`b4_original_1500`의 Action 0.3758은 B4 대비 -0.0040으로 명백한 탐색 신호입니다. 다만 예상 LB 0.23934는 과신 금지. `5500`은 B4와 매우 가까워 재현성 확인 신호 정도입니다. **별도 visual 측정값이 없으므로 “Action+Visual 개선”은 확정 불가**입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1060-docs/plans/fresh_restart/codex_pivot_tick8.txt:1031:3. 실측 슬롯  
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1071-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:41:   - v5b_ANCH 실측 0.24524, seed1 0.270, TTO 0.04 (위반), e_select_ANCH 0.263
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1072-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:42:   - 이 4개 실측점으로 우리 로컬 metric 캘리브레이션
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1073-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:43:   - Codex v5 경고: "각 CSV 실측 보고 selection도 kit 정보 활용" — 신중
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1074:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:46:   - 새 학습 launch 전: 판독기 신뢰도 확인 (실측 vs 예측 오차 ±0.02 이내)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1075-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:52:- `submission_ANCHORED_soft.csv` — 실측 **0.24524** ⭐ 안전본
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1076-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:53:- `submission_e_select_ANCH.csv` — 실측 **0.263** (E selector 결과, marginal)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1077-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:54:- 나머지 v5b_ANCH_* 6 variant (실측 안 함, 예상 ~0.245)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1078-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:55:- `submission_geomv3_ANCH_*` 3 variant (실측 안 함, 예상 ~0.25~0.27)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1079-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:61:- `submission_tto_v5b_ANCH_dino16.csv` — 실측 0.04지만 실격 대상
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1080:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:66:| Cosmos3-Nano v5b LoRA 40k | `checkpoints/cosmos3_nano_v5_base/ckpt_step040000.pt` | 실측 0.245 기반 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1081-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:110:1. 홀드아웃 50에서 실측 CSV들의 R3D/DINO/Action 관계 로컬 재계산
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1082-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:111:2. 우리 E invdyn 예측 vs 실측 LB 4점 상관 계산
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1083-docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:124:6. 판독기 판정 좋으면 사용자 실측 slot 요청
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1084:docs/plans/fresh_restart/codex_v6.txt:23:- 실측 최고 (규정 준수): v5b_ANCHORED_soft 0.24524 (Cosmos3-Nano LoRA 40k step, delta_base action, first-frame anchor 후처리)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1085-docs/plans/fresh_restart/codex_v6.txt:50:4. **0.14 도달자가 사용했을 가능성 높은 pipeline**: 실측 정보 없지만 추론상.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1086:docs/plans/fresh_restart/codex_paper.txt:102:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1087:docs/plans/fresh_restart/codex_paper.txt:317:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1088-docs/plans/fresh_restart/RULES_v3_FINAL.md:7:## 🔑 핵심 통찰 (0.04 실측이 알려준 것)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1089-docs/plans/fresh_restart/RULES_v3_FINAL.md:9:**TTO 실측 0.04 breakdown**:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1090-docs/plans/fresh_restart/RULES_v3_FINAL.md:50:   - 실측 slot 사용 (dacon 제출)
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1098-docs/plans/fresh_restart/HANDOFF_2026-08-18.md:26:## 실측 최고 (규정 준수 확인)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1099-docs/plans/fresh_restart/HANDOFF_2026-08-18.md:50:| **submission_ANCHORED_soft.csv** | 0.3886 | **0.24524 실측** | ⭐ 안전본 |
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1100-docs/plans/fresh_restart/HANDOFF_2026-08-18.md:74:| 30629 fresh_infer | RUNNING | Fresh DiT 216 inference (첫 실측 signal 후보) |
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1101:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:80:2. **채점 공식 확정**: 0.3/0.3/0.4 cosine distance (Codex 인용 + TTO 0.04 실측 역산으로 검증)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1102-docs/plans/fresh_restart/HANDOFF_2026-08-18.md:97:- Action Component 통계 확인 → 실측 slot 사용 판단
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1103-docs/plans/fresh_restart/HANDOFF_2026-08-18.md:118:- **안전본 (반드시)**: `submission_ANCHORED_soft.csv` (0.24524 실측)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1104:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:119:- **도전본**: 실측 검증된 최선. E select (예상 0.235) or DynamiCrafter (예상 0.15~0.22)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1105:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:188:- 대기 중 인간 결정: 실측 slot 사용 (e_select_ANCH 검증? Fresh DiT 검증?)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1106:docs/plans/fresh_restart/PLAN.md:5:**이전 접근 모두 폐기**: v5b 40k, cprime, tier1 rerank, tier2 rank loss, tier3 adaLN — 실측 검증 실패 또는 편향 위험.
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1107:docs/plans/fresh_restart/OFFICIAL_SCORING.md:32:이전 실패의 근본 원인: 6개 LB 표본으로 fit한 대리 회귀식 (`predict_lb.py`)에서 vid_l2 계수가 음수 등 인과 오해. 새 학습은 공식 3-component 실측 위주.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1108-docs/plans/fresh_restart/OFFICIAL_SCORING.md:36:- `predict_lb.py` — **폐기 대상** (계수 대리 회귀, 실측과 발산)
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1109:docs/plans/fresh_restart/codex_v7.txt:16:## 채점식 (dacon 공식, TTO 실측 0.04로 역산 검증)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1110-docs/plans/fresh_restart/codex_v7.txt:19:**실측 breakdown**:
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1111-docs/plans/fresh_restart/codex_v7.txt:38:- E InverseDynamicsPredictor (clean-room ConvNeXt-Small+temporal, 20k step, avg l1 0.129) — selection용 (0.245 → 0.263 실측, marginal)
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1112-docs/plans/fresh_restart/codex_v7.txt:217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1126-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1127-2. **개선 신호**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1128-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1129:   Action이 4k `0.3803` → 12k `0.3647`로 거의 단조 개선됐고 B4 대비 `-0.0151`이라, 이전 1500/5500의 잡음급 신호보다 강합니다. 약한 weight가 장기 학습에서 효과를 낸다는 증거입니다.  
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1130-   그러나 **Visual 수치가 없으므로 종합 개선이라고 말할 수 없습니다.** B4v2와 Z6-B4가 이미 “좋은 Action + 나쁜 실측”을 입증했습니다. `predicted_lb=0.2349`도 신뢰구간이 아니라 희망값입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1131-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1132-3. **실측 슬롯**
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1135-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1136-4. **다음 launch**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1137-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1138:   이미 예정된 `w=0.05`를 최우선. 반드시 4k/6k/8k를 즉시 inference하십시오. 이후에는 새 학습보다 `w0025`의 10k–12k 근방 seed/짧은 continuation이 낫습니다. `w=0.075`는 후순위이며 장기 endpoint 의존 금지.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1139-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1140-5. **마감 위험**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1141-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1142:   magweight, hybrid, adapter, increasing weight, 새 predictor/RL은 전부 위험합니다. 마지막 6–10시간은 제출·파일 검증용으로 비우십시오.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1143-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1144-이전 조언인 **B4 국소 탐색, proxy 불신, visual 보존, 다중 checkpoint 선택**은 그대로 유효하며 이번 결과가 오히려 강화합니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1145-tokens used
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1154-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1155-2. **개선 신호**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1156-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1157:   Action이 4k `0.3803` → 12k `0.3647`로 거의 단조 개선됐고 B4 대비 `-0.0151`이라, 이전 1500/5500의 잡음급 신호보다 강합니다. 약한 weight가 장기 학습에서 효과를 낸다는 증거입니다.  
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1158-   그러나 **Visual 수치가 없으므로 종합 개선이라고 말할 수 없습니다.** B4v2와 Z6-B4가 이미 “좋은 Action + 나쁜 실측”을 입증했습니다. `predicted_lb=0.2349`도 신뢰구간이 아니라 희망값입니다.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1159-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1160-3. **실측 슬롯**
+--
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1163-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1164-4. **다음 launch**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1165-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1166:   이미 예정된 `w=0.05`를 최우선. 반드시 4k/6k/8k를 즉시 inference하십시오. 이후에는 새 학습보다 `w0025`의 10k–12k 근방 seed/짧은 continuation이 낫습니다. `w=0.075`는 후순위이며 장기 endpoint 의존 금지.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1167-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1168-5. **마감 위험**
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1169-   
+docs/plans/fresh_restart/codex_pivot_tick40.txt:1170:   magweight, hybrid, adapter, increasing weight, 새 predictor/RL은 전부 위험합니다. 마지막 6–10시간은 제출·파일 검증용으로 비우십시오.
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1171-
+docs/plans/fresh_restart/codex_pivot_tick40.txt-1172-이전 조언인 **B4 국소 탐색, proxy 불신, visual 보존, 다중 checkpoint 선택**은 그대로 유효하며 이번 결과가 오히려 강화합니다.
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-52-- exp2_interp_a10_cfg45 (극극 콤보)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-53-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-54-### 기타 진행
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:55:- w005 sweep 5개 완료: best step12000 Action 0.3710 pred_LB 0.2374 (실측 없이는 아마 0.247급)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-56-- w0075 sweep 5잡 running (약 30분 후)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:57:- Blackwell 학습 30758 w0075 계속
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-58-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-59-## 재활용 가능 자산
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-60-
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-66-- fresh_invdyn/invdyn_step020000.pt
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-67-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-68-## 규정 재확인 (엄격)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:69:- kit GRU / R3D-18 / DINOv2 학습/inference/selection/후처리 절대 금지
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-70-- kit backbone 별도 다운로드 surrogate 금지 (R3D-18/DINOv2-대체를 새로 다운로드해서 loss 안 됨)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-71-- 생성 mp4 수정해서 kit judge 통과 목적 금지 (TTO 사례)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-72-- **허용**: 외부 pretrained (Wan/Cosmos), 자체 clean-room predictor (E-invdyn), inference-time tricks (CFG/sampler/seed)
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-74-## 이미 폐기된 접근 (재시도 무의미)
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-75-- P2 mp4 후처리 (RIFE/FILM/SR): 규정 위반 판정
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-76-- B4v2/Z6-B4: visual 손상
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:77:- Cosmos-Predict2.5: G5 FAIL
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-78-- Track A-E: 실패
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-79-- Wan2.1-Fun, SVD, DynamiCrafter, HunyuanVideo, CogVideoX2, Open-Sora Plan2: 폐기
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-80-
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-114-   - 어떤 새 candidate 후보를 queue에 계속 넣어야 하나?
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-115-   - Codex 자문 자동 통합 유지
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-116-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:117:우선순위 top-3 즉시 launch용 명확히. 새 학습 launch 필요하면 시간 예산 명시.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-118-"""
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-119-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-120-codex
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:121:냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-122-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-123-1. 현실적 ceiling
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-124-
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-160-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-161-5. 놓친 방향
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-162-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:163:Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-164-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-165-즉시 launch Top-3:
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-166-
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-171-자동 loop는 매 wave마다 predictor 보정 → Pareto filter → 가장 불확실한 CFG/seed/refinement 후보 queue 순으로 돌리되, **두 wave 연속 예상 개선 <0.001이면 해당 축을 KILL**해야 합니다. “무한 반복”은 가능하지만 새 정보 없는 반복은 계산만 태웁니다.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-172-tokens used
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-173-5,982
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:174:냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-175-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-176-1. 현실적 ceiling
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-177-
+--
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-213-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-214-5. 놓친 방향
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-215-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt:216:Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-217-
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-218-즉시 launch Top-3:
+docs/plans/fresh_restart/codex_extreme_v2_plan.txt-219-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-16-
+docs/plans/fresh_restart/codex_predict25_plan.txt-17-## 실측 현황
+docs/plans/fresh_restart/codex_predict25_plan.txt-18-- 안전본 v5b_ANCH: LB 0.24524
+docs/plans/fresh_restart/codex_predict25_plan.txt:19:- 도전본 B4 step6000: LB 0.2407 (Cosmos3-Nano LoRA rank32, w=0.05 E-loss, delta_base action, 6k step)
+docs/plans/fresh_restart/codex_predict25_plan.txt-20-- 어제 extreme trick 실측: 0.2437 (예측식 안전영역 실증적으로 정확)
+docs/plans/fresh_restart/codex_predict25_plan.txt-21-- Visual term 실측 ≈ 0.089 = **거의 hard ceiling** (모든 우리 fine-tune variant에서 유사)
+docs/plans/fresh_restart/codex_predict25_plan.txt-22-- Action ↓ 하면 Visual ↑ Pareto 벽 확인
+docs/plans/fresh_restart/codex_predict25_plan.txt-23-
+docs/plans/fresh_restart/codex_predict25_plan.txt-24-## 사용자 제안 (구체적)
+docs/plans/fresh_restart/codex_predict25_plan.txt-25-
+docs/plans/fresh_restart/codex_predict25_plan.txt:26:nvidia/Cosmos-Predict2.5-2B **action-conditioned 체크포인트** (base 아님) 사용.
+docs/plans/fresh_restart/codex_predict25_plan.txt-27-
+docs/plans/fresh_restart/codex_predict25_plan.txt-28-**Data adaptation**:
+docs/plans/fresh_restart/codex_predict25_plan.txt-29-- SO-100 (6-DoF joint angles) → FK → Bridge 7D 포맷 (EE pose 6 + gripper width 1)
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-32-
+docs/plans/fresh_restart/codex_predict25_plan.txt-33-**Training strategy**:
+docs/plans/fresh_restart/codex_predict25_plan.txt-34-- **256×320 AC config로 먼저 full post-training** (전체 파라미터 unfreeze)
+docs/plans/fresh_restart/codex_predict25_plan.txt:35:- 오버피팅 조짐 (validation loss 상승, visual proxy 악화) 보이면 → LoRA fallback
+docs/plans/fresh_restart/codex_predict25_plan.txt:36:- LoRA: rank 64, alpha 64, targets = attention + FFN, action path는 full LR
+docs/plans/fresh_restart/codex_predict25_plan.txt-37-
+docs/plans/fresh_restart/codex_predict25_plan.txt:38:## 이전 Cosmos-Predict2.5 시도 (Track A, 실패)
+docs/plans/fresh_restart/codex_predict25_plan.txt-39-- 4.25GB action-cond ckpt 다운로드 완료: `/home1/sota/inha2026/models/predict2.5_action_cond/`
+docs/plans/fresh_restart/codex_predict25_plan.txt-40-- Smoke G1~G4 PASS, **G5 falsification FAIL**:
+docs/plans/fresh_restart/codex_predict25_plan.txt-41-  - D_action/D_seed = 0.64 (target ≥2) — action 조건이 seed 변화보다 영향 작음
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-54-- pipeline `Video2WorldActionConditionedPipeline.__call__`은 T=1 이미지 크래시 (첫 프레임 13번 복제로 우회)
+docs/plans/fresh_restart/codex_predict25_plan.txt-55-- 최대 A6000_ada 46GB / Blackwell 95GB, 2B 추론 17.6GB peak (여유)
+docs/plans/fresh_restart/codex_predict25_plan.txt-56-
+docs/plans/fresh_restart/codex_predict25_plan.txt:57:## 다른 진행중 (병렬 불가한 backbone 학습 자원 = Blackwell 1개)
+docs/plans/fresh_restart/codex_predict25_plan.txt:58:- 30758 b4sw_bw_w0075 학습 계속 중 (약 3~4h 남음)
+docs/plans/fresh_restart/codex_predict25_plan.txt-59-- Multi-seed rejection sampling 12잡 A6000_ada running (진행 중)
+docs/plans/fresh_restart/codex_predict25_plan.txt:60:- 나의 대안 제안: Cosmos3-Nano LoRA rank 128 + full attention target 확장 + CLIP perceptual loss + 20k step. Blackwell 6~10h.
+docs/plans/fresh_restart/codex_predict25_plan.txt-61-
+docs/plans/fresh_restart/codex_predict25_plan.txt-62-## Codex 의견 필요 (brutally honest, 700 words 이내 OK)
+docs/plans/fresh_restart/codex_predict25_plan.txt-63-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-66-   - IMPLEMENTATION_NOTES mask fix가 실제 근본 해결책인지, 아니면 다른 원인이 있는지?
+docs/plans/fresh_restart/codex_predict25_plan.txt-67-
+docs/plans/fresh_restart/codex_predict25_plan.txt-68-2. **Format mismatch 리스크**:
+docs/plans/fresh_restart/codex_predict25_plan.txt:69:   - Predict2.5 native 256×320 × 13f × 10fps VS eval 320×512 × 16f × 6fps
+docs/plans/fresh_restart/codex_predict25_plan.txt:70:   - 학습을 native res로 하고 inference는 eval res로 하면 분포 shift 위험?
+docs/plans/fresh_restart/codex_predict25_plan.txt:71:   - 아니면 처음부터 320×512 × 16f × 6fps로 학습해야 안전한가?
+docs/plans/fresh_restart/codex_predict25_plan.txt-72-
+docs/plans/fresh_restart/codex_predict25_plan.txt:73:3. **Full post-training vs LoRA 시작**:
+docs/plans/fresh_restart/codex_predict25_plan.txt:74:   - 2B full unfreeze로 216개 소량 데이터 학습 = 심각한 오버피팅 위험 아닌가?
+docs/plans/fresh_restart/codex_predict25_plan.txt:75:   - LoRA rank 64가 오히려 안전한 시작 아닌가?
+docs/plans/fresh_restart/codex_predict25_plan.txt-76-   - "오버피팅 조짐 보이면 fallback"이 20h 시간에서 후퇴 여지 없음
+docs/plans/fresh_restart/codex_predict25_plan.txt-77-
+docs/plans/fresh_restart/codex_predict25_plan.txt-78-4. **Bridge 7D 포맷 변환**:
+docs/plans/fresh_restart/codex_predict25_plan.txt-79-   - SO-100 FK로 뽑은 EE pose가 Bridge 프리트레인 분포에 정말 fit하는지?
+docs/plans/fresh_restart/codex_predict25_plan.txt-80-   - Bridge 원래 rot 표현은? (rotation vector? quaternion? axis-angle?)
+docs/plans/fresh_restart/codex_predict25_plan.txt-81-   - Gripper width 스케일 매칭은?
+docs/plans/fresh_restart/codex_predict25_plan.txt:82:   - Bridge_orig_lerobot 학습 도메인 slot과 Predict2.5의 action embedder 관계?
+docs/plans/fresh_restart/codex_predict25_plan.txt-83-
+docs/plans/fresh_restart/codex_predict25_plan.txt:84:5. **Nano-LoRA-확장 vs Predict2.5-포스트트레인 비교**:
+docs/plans/fresh_restart/codex_predict25_plan.txt:85:   - 나의 대안 (Cosmos3-Nano rank 128 + full attention + CLIP perceptual + 20k step)
+docs/plans/fresh_restart/codex_predict25_plan.txt:86:   - vs 사용자 안 (Predict2.5 SO-100 FK 데이터로 full post-train)
+docs/plans/fresh_restart/codex_predict25_plan.txt-87-   - 어느 게 17h 시간에서 realistic 하고, 어느 게 upside 큰가?
+docs/plans/fresh_restart/codex_predict25_plan.txt-88-   - 병렬 불가 상황에서 최종 선택 근거는?
+docs/plans/fresh_restart/codex_predict25_plan.txt-89-
+docs/plans/fresh_restart/codex_predict25_plan.txt-90-6. **realistic ceiling 재평가**:
+docs/plans/fresh_restart/codex_predict25_plan.txt:91:   - Predict2.5 post-train 성공 시 LB 얼마까지 realistic?
+docs/plans/fresh_restart/codex_predict25_plan.txt:92:   - Nano LoRA 확장 성공 시 LB 얼마까지?
+docs/plans/fresh_restart/codex_predict25_plan.txt-93-   - 사용자 목표 LB < 0.2 관점에서 어느 게 더 가까이 갈 수 있나?
+docs/plans/fresh_restart/codex_predict25_plan.txt-94-
+docs/plans/fresh_restart/codex_predict25_plan.txt-95-7. **즉시 실행 가능한 실용 결정**:
+docs/plans/fresh_restart/codex_predict25_plan.txt:96:   - 지금 3시간 후 자정. B4 학습 (30758) kill 하고 즉시 backbone 학습 시작할지?
+docs/plans/fresh_restart/codex_predict25_plan.txt-97-   - Multi-seed 결과 (~40분 뒤)를 먼저 보고 판단할지?
+docs/plans/fresh_restart/codex_predict25_plan.txt-98-   - 안전본은 v5b_ANCH (0.24524) 유지가 최적인가?
+docs/plans/fresh_restart/codex_predict25_plan.txt-99-
+docs/plans/fresh_restart/codex_predict25_plan.txt-100-이전 자문(codex_extreme_v2_plan.txt, codex_extreme_plan.txt, codex_pivot_tick40.txt) 원칙과
+docs/plans/fresh_restart/codex_predict25_plan.txt:101:모순되지 않도록 재확인. 특히 "새 학습 launch = 위험" 원칙과 이 제안의 trade-off.
+docs/plans/fresh_restart/codex_predict25_plan.txt-102-
+docs/plans/fresh_restart/codex_predict25_plan.txt-103-codex
+docs/plans/fresh_restart/codex_predict25_plan.txt:104:이건 기록과 구현 상태를 함께 봐야 판단할 수 있습니다. 이전 자문 3개, IMPLEMENTATION_NOTES, Predict2.5 어댑터/설정 코드를 확인한 뒤 시간 대비 의사결정으로 압축하겠습니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-105-exec
+docs/plans/fresh_restart/codex_predict25_plan.txt-106-/bin/bash -lc "rg --files | rg 'codex_(extreme_v2_plan|extreme_plan|pivot_tick40)\\.txt|IMPLEMENTATION_NOTES|predict2\\.5|action_cond|bridge_orig|SO-100|so100'" in /home1/sota/inha2026
+docs/plans/fresh_restart/codex_predict25_plan.txt-107- succeeded in 130ms:
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2098-- exp2_interp_a10_cfg45 (극극 콤보)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2099-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2100-### 기타 진행
+docs/plans/fresh_restart/codex_predict25_plan.txt:2101:- w005 sweep 5개 완료: best step12000 Action 0.3710 pred_LB 0.2374 (실측 없이는 아마 0.247급)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2102-- w0075 sweep 5잡 running (약 30분 후)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2103:- Blackwell 학습 30758 w0075 계속
+docs/plans/fresh_restart/codex_predict25_plan.txt-2104-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2105-## 재활용 가능 자산
+docs/plans/fresh_restart/codex_predict25_plan.txt-2106-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2112-- fresh_invdyn/invdyn_step020000.pt
+docs/plans/fresh_restart/codex_predict25_plan.txt-2113-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2114-## 규정 재확인 (엄격)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2115:- kit GRU / R3D-18 / DINOv2 학습/inference/selection/후처리 절대 금지
+docs/plans/fresh_restart/codex_predict25_plan.txt-2116-- kit backbone 별도 다운로드 surrogate 금지 (R3D-18/DINOv2-대체를 새로 다운로드해서 loss 안 됨)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2117-- 생성 mp4 수정해서 kit judge 통과 목적 금지 (TTO 사례)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2118-- **허용**: 외부 pretrained (Wan/Cosmos), 자체 clean-room predictor (E-invdyn), inference-time tricks (CFG/sampler/seed)
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2120-## 이미 폐기된 접근 (재시도 무의미)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2121-- P2 mp4 후처리 (RIFE/FILM/SR): 규정 위반 판정
+docs/plans/fresh_restart/codex_predict25_plan.txt-2122-- B4v2/Z6-B4: visual 손상
+docs/plans/fresh_restart/codex_predict25_plan.txt:2123:- Cosmos-Predict2.5: G5 FAIL
+docs/plans/fresh_restart/codex_predict25_plan.txt-2124-- Track A-E: 실패
+docs/plans/fresh_restart/codex_predict25_plan.txt-2125-- Wan2.1-Fun, SVD, DynamiCrafter, HunyuanVideo, CogVideoX2, Open-Sora Plan2: 폐기
+docs/plans/fresh_restart/codex_predict25_plan.txt-2126-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2160-   - 어떤 새 candidate 후보를 queue에 계속 넣어야 하나?
+docs/plans/fresh_restart/codex_predict25_plan.txt-2161-   - Codex 자문 자동 통합 유지
+docs/plans/fresh_restart/codex_predict25_plan.txt-2162-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2163:우선순위 top-3 즉시 launch용 명확히. 새 학습 launch 필요하면 시간 예산 명시.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2164-"""
+docs/plans/fresh_restart/codex_predict25_plan.txt-2165-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2166-codex
+docs/plans/fresh_restart/codex_predict25_plan.txt:2167:냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2168-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2169-1. 현실적 ceiling
+docs/plans/fresh_restart/codex_predict25_plan.txt-2170-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2206-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2207-5. 놓친 방향
+docs/plans/fresh_restart/codex_predict25_plan.txt-2208-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2209:Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2210-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2211-즉시 launch Top-3:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2212-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2217-자동 loop는 매 wave마다 predictor 보정 → Pareto filter → 가장 불확실한 CFG/seed/refinement 후보 queue 순으로 돌리되, **두 wave 연속 예상 개선 <0.001이면 해당 축을 KILL**해야 합니다. “무한 반복”은 가능하지만 새 정보 없는 반복은 계산만 태웁니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2218-tokens used
+docs/plans/fresh_restart/codex_predict25_plan.txt-2219-5,982
+docs/plans/fresh_restart/codex_predict25_plan.txt:2220:냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2221-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2222-1. 현실적 ceiling
+docs/plans/fresh_restart/codex_predict25_plan.txt-2223-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2259-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2260-5. 놓친 방향
+docs/plans/fresh_restart/codex_predict25_plan.txt-2261-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2262:Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2263-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2264-즉시 launch Top-3:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2265-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2298-- 실측 도전본: submission_b4_step6000.csv = 0.2407
+docs/plans/fresh_restart/codex_predict25_plan.txt-2299-- 실측 실패: B4v2 = 0.2508 (visual +0.010 손상), Z6-B4 hybrid = 0.2499
+docs/plans/fresh_restart/codex_predict25_plan.txt-2300-- 예측 최고 미실측: b4_sw_w0025 step12000 Action=0.3647 (예측 LB 0.2349)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2301:- 진행중 학습: b4_sw_w005 (12k target, step8000까지 저장), b4_sw_w0075 (step5000까지)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2302-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2303-## 재활용 가능 자산 (이미 클러스터에 있음)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2304-- Wan2.2-TI2V-5B: /home1/sota/inha2026/models/wan22_ti2v_5b/ (safetensors 3-part + VAE + T5)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2305-- Wan2.1-Fun-Control (Blackwell smoke 통과: 50.2s 21.5GB peak, 49f 480x832)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2306:- Cosmos-Predict2.5-2B: /home1/sota/inha2026/models/predict2.5_action_cond/ (4.25GB, G5 falsification FAIL 이력)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2307-- Cosmos3-Nano v5 base 20k step: /home1/sota/inha2026/checkpoints/cosmos3_nano_v5_base/ckpt_step020000.pt
+docs/plans/fresh_restart/codex_predict25_plan.txt-2308-- 자체 clean-room predictors: E InverseDynamicsPredictor (ConvNeXt-Small+temporal, 20k step, avg l1 0.129)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2309-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2310-## 클러스터 자원 (현 시점)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2311:- gpu-113 Blackwell 95GB: 30757/30758 두 학습잡 사용중 (약 11~12h 남음)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2312-- gpu-108~112 A6000_ada 48GB×8×4nodes: 여유 (몇 잡만 running)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2313-- gpu-107 p6000 24GB×10: qwen 서브 (다른 사용자)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2314-- inha2026 (torch 2.6+cu124) / inha2026_bw (torch 2.15dev+cu130) env
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2321-- 허용: 외부 pretrained backbone, 자체 clean-room predictor, inference-only tricks (CFG/sampler/steps), first-frame anchor
+docs/plans/fresh_restart/codex_predict25_plan.txt-2322-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2323-## 이미 시도해서 확정 실패
+docs/plans/fresh_restart/codex_predict25_plan.txt:2324:- Track A (Cosmos-Predict2.5): G5 falsification 2회 FAIL
+docs/plans/fresh_restart/codex_predict25_plan.txt-2325-- Track B (FiLM adapter): mean-motion prior 로 수렴, action-selective signal 없음
+docs/plans/fresh_restart/codex_predict25_plan.txt:2326:- Track C (Cosmos3-Edge-Policy-DROID): d7=SO100 domain 미학습 (zero-init)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2327:- Track D (Fresh DiT scratch): 학습 수렴 불가
+docs/plans/fresh_restart/codex_predict25_plan.txt-2328-- Track E (skeleton warping): TTO 계열, 규정 위반
+docs/plans/fresh_restart/codex_predict25_plan.txt-2329-- B4v2 (constant weight): visual 손상 +0.010 → LB 악화
+docs/plans/fresh_restart/codex_predict25_plan.txt:2330:- Z6-B4 hybrid: 82M adapter + 장기학습 visual 손상
+docs/plans/fresh_restart/codex_predict25_plan.txt:2331:- Wan2.1-Fun / HunyuanVideo / SVD / DynamiCrafter / CogVideoX2 / Open-Sora Plan2 : 미검증 or 구식
+docs/plans/fresh_restart/codex_predict25_plan.txt:2332:- Cosmos-Predict2.5: backbone action-agnostic (G5)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2333-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2334-## 사용자 초안 4트랙 (내 제안, 검토 필요)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2335:- **P1 Inference tricks (즉시, 학습 무관)**: CFG scale sweep, sampler 교체(DPM++/Heun/Euler-a),
+docs/plans/fresh_restart/codex_predict25_plan.txt-2336-  sampling steps 50→200, karras noise schedule, first-frame stronger anchor (초기 latent 강제),
+docs/plans/fresh_restart/codex_predict25_plan.txt-2337-  zero-action / GT-action / shuffled-action 3-way ablation
+docs/plans/fresh_restart/codex_predict25_plan.txt-2338-- **P2 Post-processing**: RIFE/FILM temporal interpolation, VideoLDM-style denoising,
+docs/plans/fresh_restart/codex_predict25_plan.txt-2339-  mild super-resolution, first-frame paste-back, color-match  → 규정 회색 (mp4 수정 판정?)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2340:- **P3 Zero-shot 다른 backbone I2V**: Wan2.2-A14B / DreamZero 14B / Cosmos-Predict2.5 base zero-shot
+docs/plans/fresh_restart/codex_predict25_plan.txt:2341:  으로 원본 첫 프레임 조건 216 sample inference (학습 없음)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2342-- **P4 Ensemble**: 여러 CSV의 per-sample best (자체 E invdyn score 기반), pixel/latent blend
+docs/plans/fresh_restart/codex_predict25_plan.txt-2343-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2344-## 필요한 자문 (roundtable, brutally honest, 500 words 이내 OK)
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2355-   - Multi-model latent-space ensemble (VAE latent에서 blend)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2356-   - Reference frame conditioning (16f 생성이 아니라 T=1 초생성 → 15개 재조건화 재귀 생성)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2357-   - CFG++ / STG (Spatial-Temporal Guidance) 최신 sampling trick
+docs/plans/fresh_restart/codex_predict25_plan.txt:2358:   - Test-time diffusion refinement (kit 안 쓰고 자체 R3D/DINO clone 학습)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2359-   - Video inpainting mask-based first-few-frames GT copy
+docs/plans/fresh_restart/codex_predict25_plan.txt:2360:   - GT-video-guided score distillation (예측 v_pred을 GT frame 방향으로 nudge, 학습 없음)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2361-   - 다른 것?
+docs/plans/fresh_restart/codex_predict25_plan.txt-2362-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2363-4. **우선순위 top-3** (즉시 launch 순서). 병렬 리소스: A6000_ada 48GB 6~8잡 여유.
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2372-   극단 트랙별 slot 몇 개씩이 realistic?
+docs/plans/fresh_restart/codex_predict25_plan.txt-2373-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2374-이전 자문 (`codex_pivot_tick40.txt`, `codex_pivot_tick8.txt`, `codex_z5.txt`, `codex_z6.txt`, `codex_v7.txt`)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2375:와 모순되지 않도록 재확인. 이전 자문의 "새 학습 자제 / 6-10h 검증 버퍼 확보" 원칙과의 tradeoff 명시.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2376-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2377-codex
+docs/plans/fresh_restart/codex_predict25_plan.txt-2378-요청하신 이전 자문과 규정/구현 메모를 먼저 대조하겠습니다. 특히 과거 sweep의 실제 수치, “mp4 수정” 금지 문구, 현재 proxy의 신뢰도를 근거로 500단어 안쪽의 냉정한 우선순위를 내리겠습니다.
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2605-        "ckpt_step004000.pt": {
+docs/plans/fresh_restart/codex_predict25_plan.txt-2606-          "mean": 0.38025443592212266,
+docs/plans/fresh_restart/codex_predict25_plan.txt-2607-          "median": 0.35207299888134,
+docs/plans/fresh_restart/codex_predict25_plan.txt:2608:          "predicted_lb": 0.24110177436884908
+docs/plans/fresh_restart/codex_predict25_plan.txt-2609-        },
+docs/plans/fresh_restart/codex_predict25_plan.txt-2610-        "ckpt_step006000.pt": {
+docs/plans/fresh_restart/codex_predict25_plan.txt-2611-          "mean": 0.3775130001724594,
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2708-    "b4_original_1500": {
+docs/plans/fresh_restart/codex_predict25_plan.txt-2709-      "job_id": 30760,
+docs/plans/fresh_restart/codex_predict25_plan.txt-2710-      "inf_only": true,
+docs/plans/fresh_restart/codex_predict25_plan.txt:2711:# Track A — Cosmos-Predict2.5-2B action-cond viability — SUMMARY
+docs/plans/fresh_restart/codex_predict25_plan.txt-2712-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2713-**Date:** 2026-08-13 (D-6, deadline 08-19)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2714-**Total wall time consumed:** ~1h 20m (of 7h Track A budget)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2715:**Verdict:** **G5 FAIL — do not migrate to Predict2.5 for the 08-19 deadline.**
+docs/plans/fresh_restart/codex_predict25_plan.txt-2716-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2717-## Gates
+docs/plans/fresh_restart/codex_predict25_plan.txt-2718-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2743-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2744-Per-sample table in `predict2.5_falsification_pilot.md`.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2745-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2746:## Why Predict2.5 does not respond to our SO-100 actions
+docs/plans/fresh_restart/codex_predict25_plan.txt-2747-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2748-Root cause hypotheses, in order of likelihood:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2749-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2751-2. **Frame conditioning is too weak.** The action-cond training uses `conditioning_strategy = FRAME_REPLACE` with `num_conditional_frames=1`. With only one conditioning frame and no text prompt, the model has very little signal about "what scene / task this is", so it falls back on its prior — which is Bridge-shaped. This is consistent with all conditions producing visually similar outputs (the model always dreams up Bridge-ish arm motion).
+docs/plans/fresh_restart/codex_predict25_plan.txt-2752-3. **We fed a tiled-image conditioning input** because `pipe.__call__` has a bug that fails when `T=1` (`temporal_sample` needs `original_length - expected_length > 0`). We bypassed by tiling first frame across 13 pixel frames before entering `_normalize_video_databatch_inplace`. If `FRAME_REPLACE` treats all 13 tiled frames as conditioning rather than only the first, the model may be seeing "the entire 13 frames are already the ground truth" — which trivializes the task and lets any action condition produce nearly the same output. This is a plausible explanation for sample 0's `neu=rev=perm=0.000` (pure identity output). Fixing this would require correctly setting `condition_video_input_mask_B_C_T_H_W` so only frame 0 is masked as conditioning.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2753-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2754:Even if root cause 3 is fixed, cause 1 (domain shift) alone is a strong reason to expect ~5 days of adapter/LoRA training will not make Predict2.5 competitive with a Cosmos3-Nano already-tuned on SO-100 in the remaining 6 days.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2755-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2756-## Practical / cost tally
+docs/plans/fresh_restart/codex_predict25_plan.txt-2757-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2784-- Even ignoring the domain shift, we'd need to:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2785-  - (a) fix the `condition_video_input_mask` bug so the model treats only frame 0 as GT,
+docs/plans/fresh_restart/codex_predict25_plan.txt-2786-  - (b) verify action-conditioning meaningfully drives motion once (a) is fixed,
+docs/plans/fresh_restart/codex_predict25_plan.txt:2787:  - (c) train a LoRA (or full fine-tune of `action_embedder_B_D/_3D` at minimum) on SO-100 with correctly-scaled action inputs,
+docs/plans/fresh_restart/codex_predict25_plan.txt-2788-  - (d) run inference on 216 eval samples at ~90s each = ~5.4 h wall (fits, but no time to iterate).
+docs/plans/fresh_restart/codex_predict25_plan.txt:2789:- With 6 days left and no proof-of-life that Predict2.5 responds to SO-100 actions, this is a high-risk investment. Track B has known-working leaderboard baseline (`ANCHORED_soft 0.24524`) and clear next-step candidates that don't require environment upheaval.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2790-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2791-If Track A were to be resurrected later, the correct order of operations would be:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2792-1. Set `condition_video_input_mask` so latent frame 0 is marked conditioning (mask=1) and latent frames 1..3 are unconditioned (mask=0). Currently the pipeline sets an all-zero mask because we bypassed its `_get_data_batch_input` frame handling.
+docs/plans/fresh_restart/codex_predict25_plan.txt:2793:2. Repeat the pilot with that fix. If `D_action / D_seed >= 2` with correct masking, then move to LoRA fine-tune.
+docs/plans/fresh_restart/codex_predict25_plan.txt:2794:3. Train LoRA on `action_embedder_B_D`, `action_embedder_B_3D`, and the first few adaLN-LoRA layers using SO-100 delta-EE (adapter already written).
+docs/plans/fresh_restart/codex_predict25_plan.txt-2795-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2796-## Files / paths
+docs/plans/fresh_restart/codex_predict25_plan.txt-2797-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2864-scripts/so100_to_bridge_v3.py-286-                          view_point="third_person_view", mode="forward_dynamics"):
+docs/plans/fresh_restart/codex_predict25_plan.txt-2865-scripts/so100_to_bridge_v3.py-287-    """CosmosActionCondition 생성. 10D가 아닌 표현도 통과시킨다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2866-scripts/so100_to_bridge_v3.py-288-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2867:scripts/so100_to_bridge_v3.py:289:    파이프라인은 `__post_init__`에서 `raw_actions.shape[1] == raw_action_dim(=10)`을 검증하지만
+docs/plans/fresh_restart/codex_predict25_plan.txt-2868-scripts/so100_to_bridge_v3.py-290-    frozen dataclass가 아니라 **사후 대입은 통과**한다(실측). 이후 파이프라인 862행이
+docs/plans/fresh_restart/codex_predict25_plan.txt-2869-scripts/so100_to_bridge_v3.py:291:    `shape[-1] < action_dim(64)`이면 zero-pad하므로 37D도 그대로 쓰인다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2870-scripts/so100_to_bridge_v3.py-292-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2885-baseline/IMPLEMENTATION_NOTES.md-87-  2. `feat_a = action_encoder(noisy_a, ts_expanded, emb_id_0)` → `(B, 24, dim)`
+docs/plans/fresh_restart/codex_predict25_plan.txt-2886-baseline/IMPLEMENTATION_NOTES.md-88-  3. `pred_a = action_decoder(feat_a, emb_id_0)` → `(B, 24, 32)`
+docs/plans/fresh_restart/codex_predict25_plan.txt-2887---
+docs/plans/fresh_restart/codex_predict25_plan.txt:2888:baseline/IMPLEMENTATION_NOTES.md-163-- `nn.Linear`가 아닌 특수 배치 구조 → **PEFT LoRA로 직접 타겟 불가**
+docs/plans/fresh_restart/codex_predict25_plan.txt-2889-baseline/IMPLEMENTATION_NOTES.md-164-- bridge_orig_lerobot = domain ID 7
+docs/plans/fresh_restart/codex_predict25_plan.txt:2890:baseline/IMPLEMENTATION_NOTES.md-165-- 현재 LoRA 타겟(`add_q/k/v_proj`, `to_add_out`) 144개 레이어 = attention만, action_proj는 frozen
+docs/plans/fresh_restart/codex_predict25_plan.txt-2891-baseline/IMPLEMENTATION_NOTES.md-166-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2892-baseline/IMPLEMENTATION_NOTES.md-167-### bridge_orig_lerobot 도메인 정보 (실측)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2893-baseline/IMPLEMENTATION_NOTES.md:168:- raw_action_dim = 10
+docs/plans/fresh_restart/codex_predict25_plan.txt-2894-baseline/IMPLEMENTATION_NOTES.md-169-- 파이프라인 내부에서 10→64 zero-padding 후 action_proj_in에 입력
+docs/plans/fresh_restart/codex_predict25_plan.txt-2895-baseline/IMPLEMENTATION_NOTES.md-170-- **내부 정규화 없음**: 파이프라인은 raw_actions를 그대로 사용. 정규화는 외부에서 해야 함
+docs/plans/fresh_restart/codex_predict25_plan.txt:2896:baseline/IMPLEMENTATION_NOTES.md-171-- domain 7 가중치 norm: dim0-9 평균 6.6, dim10-63 평균 5.97 (pad 영역도 유사 norm — pretrain 시 bridge 전용 통계로 학습)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2897-baseline/IMPLEMENTATION_NOTES.md-172-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2898-baseline/IMPLEMENTATION_NOTES.md-173-### FK 관절 수 불일치
+docs/plans/fresh_restart/codex_predict25_plan.txt-2899-baseline/IMPLEMENTATION_NOTES.md:174:- 챌린지킷 `so100_fk.py`: **6관절** (joint 5: xyz=[-0.0202,-0.0244,0], axis=[0,0,1] — 손목 회전)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2900-baseline/IMPLEMENTATION_NOTES.md-175-- 우리 `scripts/so100_fk.py`: **5관절** (joint 5 누락)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2901-baseline/IMPLEMENTATION_NOTES.md-176-- 실측 오차: 영점 포즈 기준 y축 -2.97cm, z축 +1.09cm
+docs/plans/fresh_restart/codex_predict25_plan.txt-2902-baseline/IMPLEMENTATION_NOTES.md-177-
+docs/plans/fresh_restart/codex_predict25_plan.txt:2903:baseline/IMPLEMENTATION_NOTES.md-178-### action conditioning 실제 동작 여부 미검증
+docs/plans/fresh_restart/codex_predict25_plan.txt-2904-baseline/IMPLEMENTATION_NOTES.md-179-- GT action vs zero action vs random action으로 생성 영상 차이 측정 실험 필요
+docs/plans/fresh_restart/codex_predict25_plan.txt-2905-baseline/IMPLEMENTATION_NOTES.md-180-- 이 실험을 먼저 해야 나머지 튜닝이 의미 있음
+docs/plans/fresh_restart/codex_predict25_plan.txt-2906-baseline/IMPLEMENTATION_NOTES.md-181-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2907-baseline/IMPLEMENTATION_NOTES.md-182-### 미확인 사항 (우선순위 순)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2908-baseline/IMPLEMENTATION_NOTES.md:183:1. bridge_orig_lerobot의 action frame: world frame delta vs gripper frame delta
+docs/plans/fresh_restart/codex_predict25_plan.txt-2909-baseline/IMPLEMENTATION_NOTES.md-184-2. bridge pretraining normalization stats (WidowX EE 범위 vs SO-100 EE 범위)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2910:baseline/IMPLEMENTATION_NOTES.md-185-3. action_proj 레이어 full fine-tune 가능성 (domain 7 행만 분리 학습)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2911-baseline/IMPLEMENTATION_NOTES.md-186-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2912-baseline/IMPLEMENTATION_NOTES.md-187----
+docs/plans/fresh_restart/codex_predict25_plan.txt-2913-baseline/IMPLEMENTATION_NOTES.md-188-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2930-baseline/IMPLEMENTATION_NOTES.md-315-### G5 재도전 로드맵 (다음 세션에서 시도할 것)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2931-baseline/IMPLEMENTATION_NOTES.md-316-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2932-baseline/IMPLEMENTATION_NOTES.md:317:1. `_get_data_batch_input`을 직접 호출한 뒤 `condition_video_input_mask_B_C_T_H_W`를 수동으로 latent frame 0만 mask=1로 세팅. 현재 우회 경로에서는 마스크가 어떻게 설정되는지 불명 (모든 프레임이 conditioning으로 취급되면 action 반응이 사라지는 것을 설명 가능).
+docs/plans/fresh_restart/codex_predict25_plan.txt:2933:baseline/IMPLEMENTATION_NOTES.md-318-2. 마스크 수정 후 파일럿 재실행. `D_action/D_seed ≥ 2` 나오면 LoRA로 진행.
+docs/plans/fresh_restart/codex_predict25_plan.txt:2934:baseline/IMPLEMENTATION_NOTES.md-319-3. LoRA 타겟: `action_embedder_B_D`, `action_embedder_B_3D`, 초기 몇 개 adaLN-LoRA 레이어. SO-100 EE-delta 어댑터(scripts/predict2/adapt_so100_actions.py)를 그대로 재사용.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2935-baseline/IMPLEMENTATION_NOTES.md-320-
+docs/plans/fresh_restart/codex_predict25_plan.txt-2936-baseline/IMPLEMENTATION_NOTES.md-321----
+docs/plans/fresh_restart/codex_predict25_plan.txt-2937-baseline/IMPLEMENTATION_NOTES.md-322-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-2987-scripts/so100_to_bridge_v2.py-14-delta 기준 좌표계는 보고서에 명시가 없어 두 방식을 모두 지원한다:
+docs/plans/fresh_restart/codex_predict25_plan.txt-2988-scripts/so100_to_bridge_v2.py-15-  frame="local" : 이전 프레임 EE 좌표계 기준 (T_prev^-1 @ T_curr)
+docs/plans/fresh_restart/codex_predict25_plan.txt-2989-scripts/so100_to_bridge_v2.py-16-  frame="base"  : 로봇 base 좌표계 기준 (translation 차분, 회전은 R_prev^T @ R_curr)
+docs/plans/fresh_restart/codex_predict25_plan.txt:2990:scripts/so100_to_bridge_v2.py-17-어느 쪽이 맞는지는 학습해서 홀드아웃 지표로 비교한다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-2991---
+docs/plans/fresh_restart/codex_predict25_plan.txt-2992-scripts/so100_to_bridge_v2.py-21-import numpy as np
+docs/plans/fresh_restart/codex_predict25_plan.txt-2993-scripts/so100_to_bridge_v2.py-22-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3038-scripts/so100_to_bridge_v2.py-69-        Tp, Tc = mats[t], mats[nxt]
+docs/plans/fresh_restart/codex_predict25_plan.txt-3039-scripts/so100_to_bridge_v2.py-70-        if frame == "local":
+docs/plans/fresh_restart/codex_predict25_plan.txt-3040---
+docs/plans/fresh_restart/codex_predict25_plan.txt:3041:scripts/predict2/adapt_so100_actions.py-1-"""SO-100 joint angles -> Cosmos-Predict2.5-2B action-cond (12,7) input.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3042-scripts/predict2/adapt_so100_actions.py-2-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3043-scripts/predict2/adapt_so100_actions.py-3-Contract (see /home1/sota/inha2026/docs/plans/road-to-0.17/predict2.5_inference_contract.md):
+docs/plans/fresh_restart/codex_predict25_plan.txt-3044-scripts/predict2/adapt_so100_actions.py:4:    row t = [dx, dy, dz, droll, dpitch, dyaw, gripper]  * c_act_scaler
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3288-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-13-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3289-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-14-## 트랙별 결과 요약
+docs/plans/fresh_restart/codex_predict25_plan.txt-3290-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-15-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3291:docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-16-### Track A: NVIDIA Predict2.5 LoRA
+docs/plans/fresh_restart/codex_predict25_plan.txt-3292-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md:17:- 목표: Bridge V2 pretrained action-conditioning 활용
+docs/plans/fresh_restart/codex_predict25_plan.txt:3293:docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-18-- 방법: `robot/action-cond/` 체크포인트 + LoRA
+docs/plans/fresh_restart/codex_predict25_plan.txt-3294-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-19-- **결과**: G5 falsification FAIL (effect_action=0.64, target 2.0)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3295-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md:20:- Caveats: action_dim mismatch (config 84 vs ckpt 28), pipeline bypass hack
+docs/plans/fresh_restart/codex_predict25_plan.txt-3296-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-21-- **결론**: 미완결성 있지만 dead
+docs/plans/fresh_restart/codex_predict25_plan.txt-3297-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-22-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3298-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-23-### Track B: Cosmos3-Nano FiLM Adapter
+docs/plans/fresh_restart/codex_predict25_plan.txt-3299-docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-24-- 목표: layers 20-30에 zero-init FiLM으로 action 강제 주입
+docs/plans/fresh_restart/codex_predict25_plan.txt:3300:docs/plans/road-to-0.17/SESSION_2026-08-13_14_SUMMARY.md-25-- 방법: 3000 step 학습, L_FM only, 매 250 step diag
+docs/plans/fresh_restart/codex_predict25_plan.txt-3301---
+docs/plans/fresh_restart/codex_predict25_plan.txt-3302-docs/plans/road-to-0.17/ACTION_FLOW_CODE_MAP.md-8-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3303-docs/plans/road-to-0.17/ACTION_FLOW_CODE_MAP.md-9-### 1.1 Raw Action Loading
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3310-exec
+docs/plans/fresh_restart/codex_predict25_plan.txt-3311-/bin/bash -lc "sed -n '1,240p' docs/plans/road-to-0.17/predict2.5_track_a_summary.md; sed -n '110,185p' scripts/predict2/falsification_pilot.py; rg -n -C 12 'condition_video_input_mask|mask.*latent|G5|Bridge|action_dim' baseline/IMPLEMENTATION_NOTES.md; sed -n '85,155p' scripts/predict2/adapt_so100_actions.py; sed -n '1,220p' scripts/so100_to_bridge_v3.py" in /home1/sota/inha2026
+docs/plans/fresh_restart/codex_predict25_plan.txt-3312- succeeded in 0ms:
+docs/plans/fresh_restart/codex_predict25_plan.txt:3313:# Track A — Cosmos-Predict2.5-2B action-cond viability — SUMMARY
+docs/plans/fresh_restart/codex_predict25_plan.txt-3314-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3315-**Date:** 2026-08-13 (D-6, deadline 08-19)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3316-**Total wall time consumed:** ~1h 20m (of 7h Track A budget)
+docs/plans/fresh_restart/codex_predict25_plan.txt:3317:**Verdict:** **G5 FAIL — do not migrate to Predict2.5 for the 08-19 deadline.**
+docs/plans/fresh_restart/codex_predict25_plan.txt-3318-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3319-## Gates
+docs/plans/fresh_restart/codex_predict25_plan.txt-3320-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3345-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3346-Per-sample table in `predict2.5_falsification_pilot.md`.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3347-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3348:## Why Predict2.5 does not respond to our SO-100 actions
+docs/plans/fresh_restart/codex_predict25_plan.txt-3349-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3350-Root cause hypotheses, in order of likelihood:
+docs/plans/fresh_restart/codex_predict25_plan.txt-3351-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3353-2. **Frame conditioning is too weak.** The action-cond training uses `conditioning_strategy = FRAME_REPLACE` with `num_conditional_frames=1`. With only one conditioning frame and no text prompt, the model has very little signal about "what scene / task this is", so it falls back on its prior — which is Bridge-shaped. This is consistent with all conditions producing visually similar outputs (the model always dreams up Bridge-ish arm motion).
+docs/plans/fresh_restart/codex_predict25_plan.txt-3354-3. **We fed a tiled-image conditioning input** because `pipe.__call__` has a bug that fails when `T=1` (`temporal_sample` needs `original_length - expected_length > 0`). We bypassed by tiling first frame across 13 pixel frames before entering `_normalize_video_databatch_inplace`. If `FRAME_REPLACE` treats all 13 tiled frames as conditioning rather than only the first, the model may be seeing "the entire 13 frames are already the ground truth" — which trivializes the task and lets any action condition produce nearly the same output. This is a plausible explanation for sample 0's `neu=rev=perm=0.000` (pure identity output). Fixing this would require correctly setting `condition_video_input_mask_B_C_T_H_W` so only frame 0 is masked as conditioning.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3355-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3356:Even if root cause 3 is fixed, cause 1 (domain shift) alone is a strong reason to expect ~5 days of adapter/LoRA training will not make Predict2.5 competitive with a Cosmos3-Nano already-tuned on SO-100 in the remaining 6 days.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3357-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3358-## Practical / cost tally
+docs/plans/fresh_restart/codex_predict25_plan.txt-3359-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3386-- Even ignoring the domain shift, we'd need to:
+docs/plans/fresh_restart/codex_predict25_plan.txt-3387-  - (a) fix the `condition_video_input_mask` bug so the model treats only frame 0 as GT,
+docs/plans/fresh_restart/codex_predict25_plan.txt-3388-  - (b) verify action-conditioning meaningfully drives motion once (a) is fixed,
+docs/plans/fresh_restart/codex_predict25_plan.txt:3389:  - (c) train a LoRA (or full fine-tune of `action_embedder_B_D/_3D` at minimum) on SO-100 with correctly-scaled action inputs,
+docs/plans/fresh_restart/codex_predict25_plan.txt-3390-  - (d) run inference on 216 eval samples at ~90s each = ~5.4 h wall (fits, but no time to iterate).
+docs/plans/fresh_restart/codex_predict25_plan.txt:3391:- With 6 days left and no proof-of-life that Predict2.5 responds to SO-100 actions, this is a high-risk investment. Track B has known-working leaderboard baseline (`ANCHORED_soft 0.24524`) and clear next-step candidates that don't require environment upheaval.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3392-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3393-If Track A were to be resurrected later, the correct order of operations would be:
+docs/plans/fresh_restart/codex_predict25_plan.txt-3394-1. Set `condition_video_input_mask` so latent frame 0 is marked conditioning (mask=1) and latent frames 1..3 are unconditioned (mask=0). Currently the pipeline sets an all-zero mask because we bypassed its `_get_data_batch_input` frame handling.
+docs/plans/fresh_restart/codex_predict25_plan.txt:3395:2. Repeat the pilot with that fix. If `D_action / D_seed >= 2` with correct masking, then move to LoRA fine-tune.
+docs/plans/fresh_restart/codex_predict25_plan.txt:3396:3. Train LoRA on `action_embedder_B_D`, `action_embedder_B_3D`, and the first few adaLN-LoRA layers using SO-100 delta-EE (adapter already written).
+docs/plans/fresh_restart/codex_predict25_plan.txt-3397-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3398-## Files / paths
+docs/plans/fresh_restart/codex_predict25_plan.txt-3399-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3508-92-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3509-93-## 중요 파일 경로
+docs/plans/fresh_restart/codex_predict25_plan.txt-3510-94-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3511:95-- 학습 스크립트: `/home1/sota/inha2026/scripts/finetune_dreamzero_full.py`
+docs/plans/fresh_restart/codex_predict25_plan.txt-3512---
+docs/plans/fresh_restart/codex_predict25_plan.txt-3513-156-action_proj_in.fc.weight:  (32, 262144)  = 32 domains × (64 × 4096) — batched linear
+docs/plans/fresh_restart/codex_predict25_plan.txt-3514-157-action_proj_in.bias.weight: (32, 4096)
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3517-160-action_modality_embed: (4096,)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3518-161-```
+docs/plans/fresh_restart/codex_predict25_plan.txt-3519-162-- **32 domains × 각 domain별 독립 projection** 구조
+docs/plans/fresh_restart/codex_predict25_plan.txt:3520:163-- `nn.Linear`가 아닌 특수 배치 구조 → **PEFT LoRA로 직접 타겟 불가**
+docs/plans/fresh_restart/codex_predict25_plan.txt-3521-164-- bridge_orig_lerobot = domain ID 7
+docs/plans/fresh_restart/codex_predict25_plan.txt:3522:165-- 현재 LoRA 타겟(`add_q/k/v_proj`, `to_add_out`) 144개 레이어 = attention만, action_proj는 frozen
+docs/plans/fresh_restart/codex_predict25_plan.txt-3523-166-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3524-167-### bridge_orig_lerobot 도메인 정보 (실측)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3525-168:- raw_action_dim = 10
+docs/plans/fresh_restart/codex_predict25_plan.txt-3526-169-- 파이프라인 내부에서 10→64 zero-padding 후 action_proj_in에 입력
+docs/plans/fresh_restart/codex_predict25_plan.txt-3527-170-- **내부 정규화 없음**: 파이프라인은 raw_actions를 그대로 사용. 정규화는 외부에서 해야 함
+docs/plans/fresh_restart/codex_predict25_plan.txt:3528:171-- domain 7 가중치 norm: dim0-9 평균 6.6, dim10-63 평균 5.97 (pad 영역도 유사 norm — pretrain 시 bridge 전용 통계로 학습)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3529-172-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3530-173-### FK 관절 수 불일치
+docs/plans/fresh_restart/codex_predict25_plan.txt-3531-174-- 챌린지킷 `so100_fk.py`: **6관절** (joint 5: xyz=[-0.0202,-0.0244,0], axis=[0,0,1] — 손목 회전)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3532-175-- 우리 `scripts/so100_fk.py`: **5관절** (joint 5 누락)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3533-176-- 실측 오차: 영점 포즈 기준 y축 -2.97cm, z축 +1.09cm
+docs/plans/fresh_restart/codex_predict25_plan.txt-3534-177-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3535:178-### action conditioning 실제 동작 여부 미검증
+docs/plans/fresh_restart/codex_predict25_plan.txt-3536-179-- GT action vs zero action vs random action으로 생성 영상 차이 측정 실험 필요
+docs/plans/fresh_restart/codex_predict25_plan.txt-3537-180-- 이 실험을 먼저 해야 나머지 튜닝이 의미 있음
+docs/plans/fresh_restart/codex_predict25_plan.txt-3538---
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3541-285-| 28521 Phase1 | R3D/DINOv2 fp32 로드 → 220MB GPU 추가 점유 | `.half()` 적용 → 110MB로 절감 |
+docs/plans/fresh_restart/codex_predict25_plan.txt-3542-286-| 28521 Phase2 | 1.44B UNet Adam state(11.5GB) + 기존 모델(~32GB) > 46GB | `trainable_param_names: ["action_embed"]` → 백본 동결, action 레이어만 훈련 (tiny Adam state) |
+docs/plans/fresh_restart/codex_predict25_plan.txt-3543-287-| 28526 Phase2 | accumulate_grad_batches=1 → 첫 배치에서 optimizer step OOM | trainable_param_names 방식으로 해결 |
+docs/plans/fresh_restart/codex_predict25_plan.txt:3544:288-| 28541 Phase1 | `differentiable_decode_first_stage()` 가 16프레임 전체 VAE 중간 텐서를 동시에 computation graph에 유지 → 43 GB | `_extra_losses()`에서 per-frame `grad_ckpt(first_stage_model.decode, ...)` 적용 → 한 번에 1프레임만 메모리 보유 (Job 28545에서 검증 완료) |
+docs/plans/fresh_restart/codex_predict25_plan.txt-3545-289-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3546-290----
+docs/plans/fresh_restart/codex_predict25_plan.txt-3547-291-
+docs/plans/fresh_restart/codex_predict25_plan.txt:3548:292-## Cosmos-Predict2.5-2B (Track A 2026-08-13) — 마이그레이션 불가 판정
+docs/plans/fresh_restart/codex_predict25_plan.txt-3549-293-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3550-294-Track A 요약: `/home1/sota/inha2026/docs/plans/road-to-0.17/predict2.5_track_a_summary.md`
+docs/plans/fresh_restart/codex_predict25_plan.txt-3551-295:- G1~G4 PASS, G5 (falsification) FAIL: `D_action/D_seed=0.64` (target ≥2), `D_rev/D_seed=0.14` (target ≥1.5)
+docs/plans/fresh_restart/codex_predict25_plan.txt:3552:296-- 결론: Predict2.5 action-cond은 SO-100 첫 프레임에서 action-agnostic 응답. 6일 남은 상황에서 마이그레이션 비추.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3553-297-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3554-298-### 재도전 시 필수 인수인계
+docs/plans/fresh_restart/codex_predict25_plan.txt-3555-299-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3571-315:### G5 재도전 로드맵 (다음 세션에서 시도할 것)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3572-316-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3573-317:1. `_get_data_batch_input`을 직접 호출한 뒤 `condition_video_input_mask_B_C_T_H_W`를 수동으로 latent frame 0만 mask=1로 세팅. 현재 우회 경로에서는 마스크가 어떻게 설정되는지 불명 (모든 프레임이 conditioning으로 취급되면 action 반응이 사라지는 것을 설명 가능).
+docs/plans/fresh_restart/codex_predict25_plan.txt:3574:318-2. 마스크 수정 후 파일럿 재실행. `D_action/D_seed ≥ 2` 나오면 LoRA로 진행.
+docs/plans/fresh_restart/codex_predict25_plan.txt:3575:319-3. LoRA 타겟: `action_embedder_B_D`, `action_embedder_B_3D`, 초기 몇 개 adaLN-LoRA 레이어. SO-100 EE-delta 어댑터(scripts/predict2/adapt_so100_actions.py)를 그대로 재사용.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3576-320-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3577-321----
+docs/plans/fresh_restart/codex_predict25_plan.txt-3578-322-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3701-## 정규화
+docs/plans/fresh_restart/codex_predict25_plan.txt-3702-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3703-`data/train/so100_geom_statistics.json` ([1%,99%] → ±1). `scripts/compute_geom_stats.py`로 재생성.
+docs/plans/fresh_restart/codex_predict25_plan.txt:3704:**반드시 `action`(command) 기준**이다. eval에 observation.state가 없으므로 학습도 action이어야 한다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3705-(캘리브레이션용 FK는 반대로 state를 쓴다 — `docs/plans/camera-calibration/PLAN.md`)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3706-"""
+docs/plans/fresh_restart/codex_predict25_plan.txt-3707-import json
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3786-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3787-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3788-# ─────────────────────────────────────────────────────────────────────────────
+docs/plans/fresh_restart/codex_predict25_plan.txt:3789:# 표현 분기 + 파이프라인 입력 생성 — 학습/추론/홀드아웃이 갈라지지 않도록 여기 한 곳에 둔다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3790-# (`--action-repr` 불일치는 이 프로젝트에서 반복된 사고 지점이다. CLAUDE.md 참조)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3791-# ─────────────────────────────────────────────────────────────────────────────
+docs/plans/fresh_restart/codex_predict25_plan.txt-3792-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-3848-    ## v3(37D) 대비 확장
+docs/plans/fresh_restart/codex_predict25_plan.txt-3849-    - FK: 4관절(12D) → 7관절 전체(21D). joint 0/1은 상수 채널이지만 인덱스 관리 위해 유지
+docs/plans/fresh_restart/codex_predict25_plan.txt-3850-      (projection의 bias에 흡수, 무해). joint 6은 EE translation과 중복이지만
+docs/plans/fresh_restart/codex_predict25_plan.txt:3851:      학습이 자동으로 중복성 처리 가능.
+docs/plans/fresh_restart/codex_predict25_plan.txt-3852-    - 시간 축은 v3와 동일 (`pose(a[t])`는 frame t+1 자세, shift 불필요)
+docs/plans/fresh_restart/codex_predict25_plan.txt-3853-
+docs/plans/fresh_restart/codex_predict25_plan.txt-3854-    ## delta_frame 선택
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-4126-/home1/sota/anaconda3/envs/inha2026/lib/python3.11/site-packages/cosmos_predict2/models/multiview_dit.py:400:            x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
+docs/plans/fresh_restart/codex_predict25_plan.txt-4127-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4128-codex
+docs/plans/fresh_restart/codex_predict25_plan.txt:4129:냉정한 결론: **지금 Predict2.5 full post-training을 시작하면 안 됩니다.** 먼저 mask-corrected G5를 A6000에서 재실행해야 하며, 통과해도 시작점은 full unfreeze가 아니라 LoRA입니다. 17시간 내 최종 선택은 현재 B4 계열 유지가 가장 합리적입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4130-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4131-1. Action grounding
+docs/plans/fresh_restart/codex_predict25_plan.txt-4132-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4133:G5 실패가 “체크포인트 자체가 action-agnostic”임을 확정하진 않습니다. 수동 우회 경로의 conditioning mask 오류는 실제로 identity output과 낮은 action sensitivity를 설명할 수 있는 유력한 버그입니다. 따라서 mask fix는 **필수 재검증**입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4134-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4135-다만 근본 해결책이라고 가정하면 안 됩니다. 남은 원인은:
+docs/plans/fresh_restart/codex_predict25_plan.txt-4136-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-4140-- SO-100 FK 좌표계와 Bridge EE 좌표계 차이
+docs/plans/fresh_restart/codex_predict25_plan.txt-4141-- action timing/chunk alignment 오류
+docs/plans/fresh_restart/codex_predict25_plan.txt-4142-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4143:따라서 올바른 순서는 `mask fix → 동일 seed GT/zero/reverse/permuted G5 → 통과 시 학습`입니다. `D_action/D_seed < 1.5` 또는 reverse sensitivity가 계속 낮으면 즉시 폐기하십시오. 학습으로 죽은 입력 경로를 살리려는 것은 도박입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4144-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4145-2. 포맷과 action 변환
+docs/plans/fresh_restart/codex_predict25_plan.txt-4146-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4147:Predict2.5의 실제 Bridge 표현은 quaternion이 아니라 **local-frame relative XYZ 3 + relative Euler/RPY 3 + continuous gripper 1**입니다. 회전은 `Rz·Ry·Rx`에서 복원한 Euler이며 6축에 `[20,20,20,20,20,20]` scaler를 적용합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4148-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4149-그러므로 제안한 “차원별 min-max”는 네이티브 계약과 다릅니다. XYZ/RPY는 공식 scaler를 그대로 쓰고, gripper만 Bridge의 `continuous_gripper_state` 범위를 실측해 SO-100 개도도를 동일 의미/범위로 매핑해야 합니다. 현재 어댑터의 raw `0~120` gripper 입력은 명백히 위험합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4150-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4151:`bridge_orig_lerobot slot`은 Cosmos3의 32-domain action projection 구조에 관한 것이며 Predict2.5 action embedder와 직접 관계없습니다. 둘을 같은 transfer mechanism으로 보면 안 됩니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4152-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4153-3. 해상도·FPS
+docs/plans/fresh_restart/codex_predict25_plan.txt-4154-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4155:`256×320×13f×10fps` 학습 후 `320×512×16f×6fps` 추론은 공간·시간·action horizon을 동시에 바꾸는 큰 shift입니다. 반대로 처음부터 eval 포맷으로 바꾸면 pretrained contract와 action_dim=28 계약을 깨뜨립니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4156-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4157:따라서 먼저 native 포맷에서 action grounding을 검증하십시오. 실제 후보를 만들려면 최종 단계에서 eval 포맷으로 짧게 적응하거나, native 생성 결과를 시간적으로 변환해야 하지만 후자는 품질/규정 리스크가 있습니다. 이 unresolved mismatch만으로도 오늘 backbone 전환을 막기에 충분합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4158-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4159:4. Full vs LoRA
+docs/plans/fresh_restart/codex_predict25_plan.txt-4160-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4161:216개 영상에 2B full unfreeze는 심각한 catastrophic forgetting 위험입니다. validation loss가 올라간 뒤 fallback하는 전략은 17시간에 불가능합니다. **LoRA rank 32–64 + action embedder/action path full LR**, 필요하면 후반부 attention 일부만 확장하는 것이 맞습니다. Full fine-tune은 비교군이 아니라 최후 옵션입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4162-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4163-5. 어느 쪽인가
+docs/plans/fresh_restart/codex_predict25_plan.txt-4164-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4165-- **Nano 확장:** 성공 확률은 더 높지만 이미 확인된 Pareto 벽 때문에 upside가 작습니다. rank128/full-attention/CLIP-loss 세 변경을 동시에 넣는 것도 attribution과 안정성을 해칩니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4166:- **Predict2.5:** 이론적 upside는 더 크지만 현재는 mask, action semantics, 포맷 세 축이 모두 미검증입니다. 17시간 내 경쟁 submission까지 갈 확률은 낮습니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4167-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4168-현실적 LB:
+docs/plans/fresh_restart/codex_predict25_plan.txt-4169-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4170:- Nano 확장: **0.236–0.241**, 낙관적 outlier 약 **0.233**
+docs/plans/fresh_restart/codex_predict25_plan.txt:4171:- Predict2.5가 G5와 학습을 모두 성공: **0.23–0.25**, 매우 낙관적으로 **0.22대**
+docs/plans/fresh_restart/codex_predict25_plan.txt-4172-- 어느 쪽도 `<0.20`의 현실적 경로가 아닙니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4173-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4174-6. 즉시 결정
+docs/plans/fresh_restart/codex_predict25_plan.txt-4175-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4176-- **30758은 지금 kill하지 마십시오.**
+docs/plans/fresh_restart/codex_predict25_plan.txt-4177-- Multi-seed 결과를 40분 기다리는 동안 A6000에서 mask-corrected G5만 즉시 실행하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4178:- G5가 강하게 통과해도 Blackwell을 바로 넘기지 말고, 1–2시간 제한 LoRA proof-of-life에서 validation action sensitivity와 visual proxy를 확인하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4179:- G5 실패 시 Predict2.5는 영구 폐기하고 30758 완료 및 constrained multi-seed selection에 집중하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4180-- 안전본은 **v5b_ANCH 유지**, 도전 기본본은 **B4 step6000 유지**가 맞습니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4181-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4182:이는 이전의 “새 학습 launch는 위험, 검증 버퍼 확보” 원칙과 일치합니다. 지금 필요한 것은 새 backbone 학습이 아니라 **Predict2.5가 학습할 가치가 있는지 1시간 안에 falsify하는 것**입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4183-tokens used
+docs/plans/fresh_restart/codex_predict25_plan.txt-4184-57,073
+docs/plans/fresh_restart/codex_predict25_plan.txt:4185:냉정한 결론: **지금 Predict2.5 full post-training을 시작하면 안 됩니다.** 먼저 mask-corrected G5를 A6000에서 재실행해야 하며, 통과해도 시작점은 full unfreeze가 아니라 LoRA입니다. 17시간 내 최종 선택은 현재 B4 계열 유지가 가장 합리적입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4186-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4187-1. Action grounding
+docs/plans/fresh_restart/codex_predict25_plan.txt-4188-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4189:G5 실패가 “체크포인트 자체가 action-agnostic”임을 확정하진 않습니다. 수동 우회 경로의 conditioning mask 오류는 실제로 identity output과 낮은 action sensitivity를 설명할 수 있는 유력한 버그입니다. 따라서 mask fix는 **필수 재검증**입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4190-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4191-다만 근본 해결책이라고 가정하면 안 됩니다. 남은 원인은:
+docs/plans/fresh_restart/codex_predict25_plan.txt-4192-
+--
+docs/plans/fresh_restart/codex_predict25_plan.txt-4196-- SO-100 FK 좌표계와 Bridge EE 좌표계 차이
+docs/plans/fresh_restart/codex_predict25_plan.txt-4197-- action timing/chunk alignment 오류
+docs/plans/fresh_restart/codex_predict25_plan.txt-4198-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4199:따라서 올바른 순서는 `mask fix → 동일 seed GT/zero/reverse/permuted G5 → 통과 시 학습`입니다. `D_action/D_seed < 1.5` 또는 reverse sensitivity가 계속 낮으면 즉시 폐기하십시오. 학습으로 죽은 입력 경로를 살리려는 것은 도박입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4200-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4201-2. 포맷과 action 변환
+docs/plans/fresh_restart/codex_predict25_plan.txt-4202-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4203:Predict2.5의 실제 Bridge 표현은 quaternion이 아니라 **local-frame relative XYZ 3 + relative Euler/RPY 3 + continuous gripper 1**입니다. 회전은 `Rz·Ry·Rx`에서 복원한 Euler이며 6축에 `[20,20,20,20,20,20]` scaler를 적용합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4204-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4205-그러므로 제안한 “차원별 min-max”는 네이티브 계약과 다릅니다. XYZ/RPY는 공식 scaler를 그대로 쓰고, gripper만 Bridge의 `continuous_gripper_state` 범위를 실측해 SO-100 개도도를 동일 의미/범위로 매핑해야 합니다. 현재 어댑터의 raw `0~120` gripper 입력은 명백히 위험합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4206-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4207:`bridge_orig_lerobot slot`은 Cosmos3의 32-domain action projection 구조에 관한 것이며 Predict2.5 action embedder와 직접 관계없습니다. 둘을 같은 transfer mechanism으로 보면 안 됩니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4208-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4209-3. 해상도·FPS
+docs/plans/fresh_restart/codex_predict25_plan.txt-4210-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4211:`256×320×13f×10fps` 학습 후 `320×512×16f×6fps` 추론은 공간·시간·action horizon을 동시에 바꾸는 큰 shift입니다. 반대로 처음부터 eval 포맷으로 바꾸면 pretrained contract와 action_dim=28 계약을 깨뜨립니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4212-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4213:따라서 먼저 native 포맷에서 action grounding을 검증하십시오. 실제 후보를 만들려면 최종 단계에서 eval 포맷으로 짧게 적응하거나, native 생성 결과를 시간적으로 변환해야 하지만 후자는 품질/규정 리스크가 있습니다. 이 unresolved mismatch만으로도 오늘 backbone 전환을 막기에 충분합니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4214-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4215:4. Full vs LoRA
+docs/plans/fresh_restart/codex_predict25_plan.txt-4216-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4217:216개 영상에 2B full unfreeze는 심각한 catastrophic forgetting 위험입니다. validation loss가 올라간 뒤 fallback하는 전략은 17시간에 불가능합니다. **LoRA rank 32–64 + action embedder/action path full LR**, 필요하면 후반부 attention 일부만 확장하는 것이 맞습니다. Full fine-tune은 비교군이 아니라 최후 옵션입니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4218-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4219-5. 어느 쪽인가
+docs/plans/fresh_restart/codex_predict25_plan.txt-4220-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4221-- **Nano 확장:** 성공 확률은 더 높지만 이미 확인된 Pareto 벽 때문에 upside가 작습니다. rank128/full-attention/CLIP-loss 세 변경을 동시에 넣는 것도 attribution과 안정성을 해칩니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4222:- **Predict2.5:** 이론적 upside는 더 크지만 현재는 mask, action semantics, 포맷 세 축이 모두 미검증입니다. 17시간 내 경쟁 submission까지 갈 확률은 낮습니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4223-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4224-현실적 LB:
+docs/plans/fresh_restart/codex_predict25_plan.txt-4225-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4226:- Nano 확장: **0.236–0.241**, 낙관적 outlier 약 **0.233**
+docs/plans/fresh_restart/codex_predict25_plan.txt:4227:- Predict2.5가 G5와 학습을 모두 성공: **0.23–0.25**, 매우 낙관적으로 **0.22대**
+docs/plans/fresh_restart/codex_predict25_plan.txt-4228-- 어느 쪽도 `<0.20`의 현실적 경로가 아닙니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4229-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4230-6. 즉시 결정
+docs/plans/fresh_restart/codex_predict25_plan.txt-4231-
+docs/plans/fresh_restart/codex_predict25_plan.txt-4232-- **30758은 지금 kill하지 마십시오.**
+docs/plans/fresh_restart/codex_predict25_plan.txt-4233-- Multi-seed 결과를 40분 기다리는 동안 A6000에서 mask-corrected G5만 즉시 실행하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4234:- G5가 강하게 통과해도 Blackwell을 바로 넘기지 말고, 1–2시간 제한 LoRA proof-of-life에서 validation action sensitivity와 visual proxy를 확인하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt:4235:- G5 실패 시 Predict2.5는 영구 폐기하고 30758 완료 및 constrained multi-seed selection에 집중하십시오.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4236-- 안전본은 **v5b_ANCH 유지**, 도전 기본본은 **B4 step6000 유지**가 맞습니다.
+docs/plans/fresh_restart/codex_predict25_plan.txt-4237-
+docs/plans/fresh_restart/codex_predict25_plan.txt:4238:이는 이전의 “새 학습 launch는 위험, 검증 버퍼 확보” 원칙과 일치합니다. 지금 필요한 것은 새 backbone 학습이 아니라 **Predict2.5가 학습할 가치가 있는지 1시간 안에 falsify하는 것**입니다.
+The config attributes {'vision_encoder': ['transformers', 'Qwen3VLVisionModel']} were passed to Cosmos3OmniPipeline, but are not expected and will be ignored. Please verify your model_index.json configuration file.
+Keyword arguments {'vision_encoder': ['transformers', 'Qwen3VLVisionModel']} are not expected by Cosmos3OmniPipeline and will be ignored.
+Loading pipeline components...:   0%|          | 0/5 [00:00<?, ?it/s]Loading pipeline components...:  20%|██        | 1/5 [00:00<00:01,  3.55it/s]The config attributes {'clip_output': False} were passed to AutoencoderKLWan, but are not expected and will be ignored. Please verify your config.json configuration file.
+/home1/sota/anaconda3/envs/inha2026_bw/lib/python3.11/site-packages/torch/nn/utils/weight_norm.py:145: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+Loading pipeline components...:  60%|██████    | 3/5 [00:00<00:00,  3.33it/s]The config attributes {'dtype': 'bfloat16', 'freeze_und': False, 'hidden_act': 'silu', 'initializer_range': 0.02, 'joint_attn_implementation': 'two_way', 'max_action_dim': 64, 'max_position_embeddings': 262144, 'model_type': 'qwen3_vl_text', 'position_embedding_type': 'unified_3d_mrope', 'qk_norm': False, 'qk_norm_for_diffusion': True, 'qk_norm_for_text': True, 'temporal_compression_factor_sound': 1, 'use_cache': True, 'use_moe': True, 'video_temporal_causal': False} were passed to Cosmos3OmniTransformer, but are not expected and will be ignored. Please verify your config.json configuration file.
+
+Loading checkpoint shards:   0%|          | 0/7 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 7/7 [00:00<00:00, 100.96it/s]
+Loading pipeline components...: 100%|██████████| 5/5 [00:01<00:00,  5.73it/s]Loading pipeline components...: 100%|██████████| 5/5 [00:01<00:00,  4.97it/s]
+#!/bin/bash
+#SBATCH --job-name=b4sw_bw_w0075
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=gpu-113
+#SBATCH --ntasks=1
+#SBATCH --mem=160G
+#SBATCH --time=15:00:00
+#SBATCH --output=/home1/sota/inha2026/logs/fresh/b4sw_bw_w0075_%j.log
+#SBATCH --error=/home1/sota/inha2026/logs/fresh/b4sw_bw_w0075_%j.err
+set -e
+export PYTHONUNBUFFERED=1
+export HF_HUB_DISABLE_XET=1
+export HF_HOME=/home1/sota/.cache/huggingface
+NV_LIB=$(find /home1/sota/anaconda3/envs/inha2026_bw/lib/python3.11/site-packages/nvidia -maxdepth 2 -name lib -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${NV_LIB}${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RESUME=/home1/sota/inha2026/checkpoints/cosmos3_nano_v5_base/ckpt_step040000.pt
+E_CKPT=/home1/sota/inha2026/checkpoints/fresh_invdyn/invdyn_step020000.pt
+CKPT_DIR=/home1/sota/inha2026/checkpoints/b4sw_bw_w0075
+
+mkdir -p $CKPT_DIR
+/home1/sota/anaconda3/envs/inha2026_bw/bin/python \
+    /home1/sota/inha2026/fresh/training/finetune_v5b_e_loss.py \
+    --resume "$RESUME" --ckpt-dir "$CKPT_DIR" \
+    --e-invdyn-ckpt "$E_CKPT" \
+    --steps 12000 --lr 3e-5 --rank 32 --grad-acc 4 \
+    --save-every 500 \
+    --action-loss-weight 0.075 \
+    --action-repr delta_base --seed 42
+echo "[$(date)] b4sw_bw_w0075 done"
+
+exec
+/bin/bash -lc "tail -120 logs/fresh/b4sw_bw_w0075_30758.log 2>/dev/null; stat -c '%y %s %n' logs/fresh/b4sw_bw_w0075_30758.log logs/fresh/b4sw_bw_w0075_30758.err 2>/dev/null; rg -n 'step[=: ]|step [0-9]|saved|loss=' logs/fresh/b4sw_bw_w0075_30758.log | tail -30; rg -n 'action-repr|delta_base|def.*action|ACTION_REPR|proj_lr_mult' scripts/finetune_cosmos3_nano.py | head -60" in /home1/sota/inha2026
+ succeeded in 0ms:
+step 009740/12000 loss=0.1282 flow=0.1246 action=0.4855 sigma=0.8992 motion=0.0000 avg=0.2098 elapsed=16799s
+step 009760/12000 loss=0.1362 flow=0.1359 action=0.4876 sigma=0.9921 motion=0.0000 avg=0.2097 elapsed=16835s
+step 009780/12000 loss=0.2176 flow=0.2170 action=0.9306 sigma=0.9922 motion=0.0000 avg=0.2096 elapsed=16869s
+step 009800/12000 loss=0.1710 flow=0.1691 action=1.0197 sigma=0.9751 motion=0.0000 avg=0.2095 elapsed=16908s
+step 009820/12000 loss=0.5736 flow=0.5734 action=0.0714 sigma=0.9710 motion=0.0000 avg=0.2095 elapsed=16942s
+step 009840/12000 loss=0.1926 flow=0.1917 action=0.0381 sigma=0.6886 motion=0.0000 avg=0.2095 elapsed=16976s
+step 009860/12000 loss=0.2216 flow=0.2126 action=0.5104 sigma=0.7659 motion=0.0000 avg=0.2094 elapsed=17011s
+step 009880/12000 loss=0.0797 flow=0.0755 action=1.4245 sigma=0.9609 motion=0.0000 avg=0.2093 elapsed=17048s
+step 009900/12000 loss=0.1322 flow=0.1309 action=0.2245 sigma=0.9281 motion=0.0000 avg=0.2093 elapsed=17082s
+step 009920/12000 loss=0.1278 flow=0.1252 action=0.8321 sigma=0.9578 motion=0.0000 avg=0.2092 elapsed=17118s
+step 009940/12000 loss=0.1853 flow=0.1849 action=0.8142 sigma=0.9937 motion=0.0000 avg=0.2093 elapsed=17152s
+step 009960/12000 loss=0.1796 flow=0.1781 action=1.1026 sigma=0.9817 motion=0.0000 avg=0.2093 elapsed=17188s
+step 009980/12000 loss=0.5455 flow=0.5347 action=0.1671 sigma=0.1354 motion=0.0000 avg=0.2093 elapsed=17222s
+  체크포인트 저장: ckpt_step010000.pt
+step 010000/12000 loss=0.1508 flow=0.1491 action=0.1738 sigma=0.8718 motion=0.0000 avg=0.2093 elapsed=17257s
+step 010020/12000 loss=0.1417 flow=0.1399 action=0.1624 sigma=0.8525 motion=0.0000 avg=0.2094 elapsed=17292s
+step 010040/12000 loss=0.1102 flow=0.1072 action=0.4453 sigma=0.9095 motion=0.0000 avg=0.2093 elapsed=17327s
+step 010060/12000 loss=0.1731 flow=0.1727 action=0.9538 sigma=0.9946 motion=0.0000 avg=0.2093 elapsed=17361s
+step 010080/12000 loss=0.1349 flow=0.1319 action=0.8350 sigma=0.9522 motion=0.0000 avg=0.2093 elapsed=17397s
+step 010100/12000 loss=0.0701 flow=0.0699 action=0.1273 sigma=0.9724 motion=0.0000 avg=0.2094 elapsed=17431s
+step 010120/12000 loss=0.1234 flow=0.1210 action=0.4306 sigma=0.9259 motion=0.0000 avg=0.2094 elapsed=17466s
+step 010140/12000 loss=0.1516 flow=0.1494 action=0.3987 sigma=0.9272 motion=0.0000 avg=0.2095 elapsed=17500s
+step 010160/12000 loss=0.1054 flow=0.1043 action=0.1000 sigma=0.8616 motion=0.0000 avg=0.2095 elapsed=17534s
+step 010180/12000 loss=0.0392 flow=0.0388 action=0.9072 sigma=0.9937 motion=0.0000 avg=0.2095 elapsed=17569s
+step 010200/12000 loss=0.1237 flow=0.1211 action=0.1363 sigma=0.7510 motion=0.0000 avg=0.2094 elapsed=17605s
+step 010220/12000 loss=0.1671 flow=0.1633 action=0.1284 sigma=0.6022 motion=0.0000 avg=0.2094 elapsed=17639s
+step 010240/12000 loss=0.0969 flow=0.0956 action=0.4783 sigma=0.9642 motion=0.0000 avg=0.2094 elapsed=17673s
+step 010260/12000 loss=0.0965 flow=0.0957 action=0.4752 sigma=0.9777 motion=0.0000 avg=0.2093 elapsed=17709s
+step 010280/12000 loss=0.1556 flow=0.1553 action=0.1534 sigma=0.9735 motion=0.0000 avg=0.2094 elapsed=17744s
+step 010300/12000 loss=0.0969 flow=0.0962 action=0.5722 sigma=0.9837 motion=0.0000 avg=0.2095 elapsed=17778s
+step 010320/12000 loss=0.1711 flow=0.1578 action=0.6870 sigma=0.7432 motion=0.0000 avg=0.2094 elapsed=17815s
+step 010340/12000 loss=0.1585 flow=0.1565 action=1.2504 sigma=0.9790 motion=0.0000 avg=0.2094 elapsed=17851s
+step 010360/12000 loss=0.1313 flow=0.1310 action=0.7717 sigma=0.9937 motion=0.0000 avg=0.2093 elapsed=17887s
+step 010380/12000 loss=0.1423 flow=0.1302 action=0.6585 sigma=0.7556 motion=0.0000 avg=0.2093 elapsed=17921s
+step 010400/12000 loss=0.2302 flow=0.2298 action=0.6477 sigma=0.9921 motion=0.0000 avg=0.2093 elapsed=17956s
+step 010420/12000 loss=0.1447 flow=0.1424 action=0.2703 sigma=0.8892 motion=0.0000 avg=0.2093 elapsed=17990s
+step 010440/12000 loss=0.1127 flow=0.1105 action=0.1943 sigma=0.8515 motion=0.0000 avg=0.2093 elapsed=18024s
+step 010460/12000 loss=0.1816 flow=0.1777 action=0.1661 sigma=0.6867 motion=0.0000 avg=0.2093 elapsed=18060s
+step 010480/12000 loss=0.3665 flow=0.2727 action=2.5803 sigma=0.5154 motion=0.0000 avg=0.2094 elapsed=18094s
+  체크포인트 저장: ckpt_step010500.pt
+step 010500/12000 loss=0.1911 flow=0.1795 action=0.3547 sigma=0.5644 motion=0.0000 avg=0.2093 elapsed=18129s
+step 010520/12000 loss=0.0975 flow=0.0952 action=0.3923 sigma=0.9226 motion=0.0000 avg=0.2093 elapsed=18163s
+step 010540/12000 loss=0.0815 flow=0.0805 action=1.0789 sigma=0.9874 motion=0.0000 avg=0.2092 elapsed=18199s
+step 010560/12000 loss=0.0815 flow=0.0796 action=1.3910 sigma=0.9820 motion=0.0000 avg=0.2092 elapsed=18234s
+step 010580/12000 loss=0.1464 flow=0.1385 action=0.2102 sigma=0.5011 motion=0.0000 avg=0.2093 elapsed=18269s
+step 010600/12000 loss=0.2374 flow=0.2349 action=0.0915 sigma=0.6360 motion=0.0000 avg=0.2094 elapsed=18304s
+step 010620/12000 loss=0.0826 flow=0.0822 action=0.2184 sigma=0.9764 motion=0.0000 avg=0.2094 elapsed=18338s
+step 010640/12000 loss=0.1042 flow=0.1039 action=0.4668 sigma=0.9906 motion=0.0000 avg=0.2094 elapsed=18373s
+step 010660/12000 loss=0.1176 flow=0.1163 action=0.6186 sigma=0.9718 motion=0.0000 avg=0.2094 elapsed=18407s
+step 010680/12000 loss=0.0528 flow=0.0487 action=1.2799 sigma=0.9575 motion=0.0000 avg=0.2093 elapsed=18442s
+step 010700/12000 loss=0.0923 flow=0.0880 action=0.3725 sigma=0.8437 motion=0.0000 avg=0.2092 elapsed=18479s
+step 010720/12000 loss=0.4836 flow=0.4822 action=0.0241 sigma=0.2381 motion=0.0000 avg=0.2093 elapsed=18514s
+step 010740/12000 loss=0.1639 flow=0.1631 action=0.9864 sigma=0.9899 motion=0.0000 avg=0.2092 elapsed=18549s
+step 010760/12000 loss=0.1447 flow=0.1418 action=0.1792 sigma=0.7908 motion=0.0000 avg=0.2093 elapsed=18584s
+step 010780/12000 loss=0.0999 flow=0.0868 action=0.9166 sigma=0.8085 motion=0.0000 avg=0.2092 elapsed=18622s
+step 010800/12000 loss=0.1181 flow=0.1171 action=0.5533 sigma=0.9779 motion=0.0000 avg=0.2092 elapsed=18658s
+step 010820/12000 loss=0.1515 flow=0.1508 action=0.3669 sigma=0.9751 motion=0.0000 avg=0.2092 elapsed=18693s
+step 010840/12000 loss=0.5239 flow=0.5234 action=0.2878 sigma=0.9744 motion=0.0000 avg=0.2092 elapsed=18728s
+step 010860/12000 loss=0.3401 flow=0.3262 action=0.2296 sigma=0.1950 motion=0.0000 avg=0.2091 elapsed=18767s
+step 010880/12000 loss=0.1496 flow=0.1467 action=1.0142 sigma=0.9622 motion=0.0000 avg=0.2090 elapsed=18801s
+step 010900/12000 loss=0.1672 flow=0.1504 action=0.6387 sigma=0.6502 motion=0.0000 avg=0.2091 elapsed=18836s
+step 010920/12000 loss=0.1883 flow=0.1869 action=0.5738 sigma=0.9664 motion=0.0000 avg=0.2090 elapsed=18871s
+step 010940/12000 loss=0.1180 flow=0.1161 action=0.1559 sigma=0.8377 motion=0.0000 avg=0.2090 elapsed=18905s
+step 010960/12000 loss=0.1414 flow=0.1399 action=0.2735 sigma=0.9250 motion=0.0000 avg=0.2090 elapsed=18941s
+step 010980/12000 loss=0.2768 flow=0.2353 action=1.0261 sigma=0.4599 motion=0.0000 avg=0.2090 elapsed=18975s
+  체크포인트 저장: ckpt_step011000.pt
+step 011000/12000 loss=0.5047 flow=0.4945 action=0.1767 sigma=0.2239 motion=0.0000 avg=0.2089 elapsed=19010s
+step 011020/12000 loss=0.1635 flow=0.1627 action=0.7614 sigma=0.9865 motion=0.0000 avg=0.2089 elapsed=19045s
+step 011040/12000 loss=0.0936 flow=0.0893 action=1.2839 sigma=0.9552 motion=0.0000 avg=0.2089 elapsed=19080s
+step 011060/12000 loss=0.1305 flow=0.1304 action=0.1446 sigma=0.9922 motion=0.0000 avg=0.2090 elapsed=19115s
+step 011080/12000 loss=0.1298 flow=0.1296 action=0.2426 sigma=0.9908 motion=0.0000 avg=0.2090 elapsed=19151s
+step 011100/12000 loss=0.1420 flow=0.1416 action=0.8843 sigma=0.9933 motion=0.0000 avg=0.2090 elapsed=19186s
+step 011120/12000 loss=0.1640 flow=0.1623 action=0.1868 sigma=0.8726 motion=0.0000 avg=0.2090 elapsed=19220s
+step 011140/12000 loss=0.1534 flow=0.1531 action=0.4463 sigma=0.9934 motion=0.0000 avg=0.2090 elapsed=19256s
+step 011160/12000 loss=0.1185 flow=0.1120 action=3.1974 sigma=0.9729 motion=0.0000 avg=0.2089 elapsed=19291s
+step 011180/12000 loss=0.2621 flow=0.2397 action=0.3973 sigma=0.2485 motion=0.0000 avg=0.2089 elapsed=19330s
+step 011200/12000 loss=0.1326 flow=0.1322 action=0.5562 sigma=0.9905 motion=0.0000 avg=0.2089 elapsed=19366s
+step 011220/12000 loss=0.4286 flow=0.4213 action=0.1156 sigma=0.1602 motion=0.0000 avg=0.2089 elapsed=19401s
+step 011240/12000 loss=0.1269 flow=0.1266 action=0.2881 sigma=0.9829 motion=0.0000 avg=0.2089 elapsed=19435s
+step 011260/12000 loss=0.2600 flow=0.2553 action=0.0936 sigma=0.3336 motion=0.0000 avg=0.2089 elapsed=19470s
+step 011280/12000 loss=0.1164 flow=0.1154 action=0.1169 sigma=0.8758 motion=0.0000 avg=0.2089 elapsed=19505s
+step 011300/12000 loss=0.2219 flow=0.2190 action=0.1058 sigma=0.6298 motion=0.0000 avg=0.2088 elapsed=19539s
+step 011320/12000 loss=0.0509 flow=0.0508 action=0.1029 sigma=0.9832 motion=0.0000 avg=0.2088 elapsed=19575s
+step 011340/12000 loss=0.2959 flow=0.2439 action=1.5515 sigma=0.5529 motion=0.0000 avg=0.2089 elapsed=19610s
+step 011360/12000 loss=0.2470 flow=0.2453 action=0.0367 sigma=0.3987 motion=0.0000 avg=0.2088 elapsed=19648s
+step 011380/12000 loss=0.1219 flow=0.1093 action=1.4326 sigma=0.8827 motion=0.0000 avg=0.2087 elapsed=19685s
+step 011400/12000 loss=0.5012 flow=0.5009 action=0.1718 sigma=0.9826 motion=0.0000 avg=0.2088 elapsed=19721s
+step 011420/12000 loss=0.6063 flow=0.5895 action=0.2681 sigma=0.1618 motion=0.0000 avg=0.2089 elapsed=19755s
+step 011440/12000 loss=0.2100 flow=0.2099 action=0.1212 sigma=0.9914 motion=0.0000 avg=0.2090 elapsed=19790s
+step 011460/12000 loss=0.3218 flow=0.3216 action=0.0382 sigma=0.9349 motion=0.0000 avg=0.2092 elapsed=19825s
+step 011480/12000 loss=0.1209 flow=0.1198 action=0.9819 sigma=0.9854 motion=0.0000 avg=0.2091 elapsed=19859s
+  체크포인트 저장: ckpt_step011500.pt
+step 011500/12000 loss=0.1938 flow=0.1931 action=0.1068 sigma=0.9134 motion=0.0000 avg=0.2090 elapsed=19894s
+step 011520/12000 loss=0.1172 flow=0.1160 action=0.2975 sigma=0.9427 motion=0.0000 avg=0.2090 elapsed=19929s
+step 011540/12000 loss=0.1668 flow=0.1664 action=1.0408 sigma=0.9950 motion=0.0000 avg=0.2091 elapsed=19965s
+step 011560/12000 loss=0.0575 flow=0.0565 action=0.6445 sigma=0.9799 motion=0.0000 avg=0.2091 elapsed=20000s
+step 011580/12000 loss=0.1506 flow=0.1498 action=0.9111 sigma=0.9890 motion=0.0000 avg=0.2092 elapsed=20035s
+step 011600/12000 loss=0.2020 flow=0.2013 action=1.2166 sigma=0.9928 motion=0.0000 avg=0.2093 elapsed=20069s
+step 011620/12000 loss=0.1281 flow=0.1249 action=0.6916 sigma=0.9395 motion=0.0000 avg=0.2093 elapsed=20104s
+step 011640/12000 loss=0.2863 flow=0.2814 action=0.1156 sigma=0.4280 motion=0.0000 avg=0.2093 elapsed=20140s
+step 011660/12000 loss=0.1193 flow=0.1177 action=0.4594 sigma=0.9544 motion=0.0000 avg=0.2092 elapsed=20174s
+step 011680/12000 loss=0.1665 flow=0.1650 action=2.0272 sigma=0.9902 motion=0.0000 avg=0.2092 elapsed=20209s
+step 011700/12000 loss=0.1292 flow=0.1185 action=7.0839 sigma=0.9799 motion=0.0000 avg=0.2092 elapsed=20246s
+step 011720/12000 loss=0.0720 flow=0.0712 action=0.2178 sigma=0.9471 motion=0.0000 avg=0.2092 elapsed=20280s
+step 011740/12000 loss=0.1422 flow=0.1395 action=0.2760 sigma=0.8676 motion=0.0000 avg=0.2091 elapsed=20315s
+step 011760/12000 loss=0.0970 flow=0.0957 action=0.4917 sigma=0.9646 motion=0.0000 avg=0.2091 elapsed=20349s
+step 011780/12000 loss=0.1082 flow=0.1072 action=0.3665 sigma=0.9646 motion=0.0000 avg=0.2091 elapsed=20384s
+step 011800/12000 loss=0.4097 flow=0.4072 action=0.2693 sigma=0.8766 motion=0.0000 avg=0.2091 elapsed=20421s
+step 011820/12000 loss=0.0845 flow=0.0841 action=0.4733 sigma=0.9897 motion=0.0000 avg=0.2091 elapsed=20455s
+step 011840/12000 loss=0.0624 flow=0.0623 action=0.0127 sigma=0.9036 motion=0.0000 avg=0.2091 elapsed=20490s
+step 011860/12000 loss=0.3781 flow=0.3560 action=0.3804 sigma=0.2279 motion=0.0000 avg=0.2091 elapsed=20526s
+step 011880/12000 loss=0.1401 flow=0.1298 action=0.5955 sigma=0.7688 motion=0.0000 avg=0.2091 elapsed=20561s
+step 011900/12000 loss=0.1916 flow=0.1898 action=0.0376 sigma=0.3671 motion=0.0000 avg=0.2091 elapsed=20596s
+step 011920/12000 loss=0.3099 flow=0.2772 action=0.5951 sigma=0.2677 motion=0.0000 avg=0.2091 elapsed=20631s
+step 011940/12000 loss=0.4454 flow=0.4452 action=0.2162 sigma=0.9905 motion=0.0000 avg=0.2092 elapsed=20666s
+step 011960/12000 loss=0.1888 flow=0.1876 action=0.3488 sigma=0.9522 motion=0.0000 avg=0.2091 elapsed=20701s
+step 011980/12000 loss=0.1237 flow=0.1230 action=1.2124 sigma=0.9923 motion=0.0000 avg=0.2092 elapsed=20736s
+  체크포인트 저장: ckpt_step012000.pt
+학습 완료
+[Wed Aug 19 10:19:30 AM UTC 2026] b4sw_bw_w0075 done
+2026-08-19 19:19:30.312243235 +0900 66721 logs/fresh/b4sw_bw_w0075_30758.log
+2026-08-19 13:33:14.886620263 +0900 1989 logs/fresh/b4sw_bw_w0075_30758.err
+602:step 011400/12000 loss=0.5012 flow=0.5009 action=0.1718 sigma=0.9826 motion=0.0000 avg=0.2088 elapsed=19721s
+603:step 011420/12000 loss=0.6063 flow=0.5895 action=0.2681 sigma=0.1618 motion=0.0000 avg=0.2089 elapsed=19755s
+604:step 011440/12000 loss=0.2100 flow=0.2099 action=0.1212 sigma=0.9914 motion=0.0000 avg=0.2090 elapsed=19790s
+605:step 011460/12000 loss=0.3218 flow=0.3216 action=0.0382 sigma=0.9349 motion=0.0000 avg=0.2092 elapsed=19825s
+606:step 011480/12000 loss=0.1209 flow=0.1198 action=0.9819 sigma=0.9854 motion=0.0000 avg=0.2091 elapsed=19859s
+608:step 011500/12000 loss=0.1938 flow=0.1931 action=0.1068 sigma=0.9134 motion=0.0000 avg=0.2090 elapsed=19894s
+609:step 011520/12000 loss=0.1172 flow=0.1160 action=0.2975 sigma=0.9427 motion=0.0000 avg=0.2090 elapsed=19929s
+610:step 011540/12000 loss=0.1668 flow=0.1664 action=1.0408 sigma=0.9950 motion=0.0000 avg=0.2091 elapsed=19965s
+611:step 011560/12000 loss=0.0575 flow=0.0565 action=0.6445 sigma=0.9799 motion=0.0000 avg=0.2091 elapsed=20000s
+612:step 011580/12000 loss=0.1506 flow=0.1498 action=0.9111 sigma=0.9890 motion=0.0000 avg=0.2092 elapsed=20035s
+613:step 011600/12000 loss=0.2020 flow=0.2013 action=1.2166 sigma=0.9928 motion=0.0000 avg=0.2093 elapsed=20069s
+614:step 011620/12000 loss=0.1281 flow=0.1249 action=0.6916 sigma=0.9395 motion=0.0000 avg=0.2093 elapsed=20104s
+615:step 011640/12000 loss=0.2863 flow=0.2814 action=0.1156 sigma=0.4280 motion=0.0000 avg=0.2093 elapsed=20140s
+616:step 011660/12000 loss=0.1193 flow=0.1177 action=0.4594 sigma=0.9544 motion=0.0000 avg=0.2092 elapsed=20174s
+617:step 011680/12000 loss=0.1665 flow=0.1650 action=2.0272 sigma=0.9902 motion=0.0000 avg=0.2092 elapsed=20209s
+618:step 011700/12000 loss=0.1292 flow=0.1185 action=7.0839 sigma=0.9799 motion=0.0000 avg=0.2092 elapsed=20246s
+619:step 011720/12000 loss=0.0720 flow=0.0712 action=0.2178 sigma=0.9471 motion=0.0000 avg=0.2092 elapsed=20280s
+620:step 011740/12000 loss=0.1422 flow=0.1395 action=0.2760 sigma=0.8676 motion=0.0000 avg=0.2091 elapsed=20315s
+621:step 011760/12000 loss=0.0970 flow=0.0957 action=0.4917 sigma=0.9646 motion=0.0000 avg=0.2091 elapsed=20349s
+622:step 011780/12000 loss=0.1082 flow=0.1072 action=0.3665 sigma=0.9646 motion=0.0000 avg=0.2091 elapsed=20384s
+623:step 011800/12000 loss=0.4097 flow=0.4072 action=0.2693 sigma=0.8766 motion=0.0000 avg=0.2091 elapsed=20421s
+624:step 011820/12000 loss=0.0845 flow=0.0841 action=0.4733 sigma=0.9897 motion=0.0000 avg=0.2091 elapsed=20455s
+625:step 011840/12000 loss=0.0624 flow=0.0623 action=0.0127 sigma=0.9036 motion=0.0000 avg=0.2091 elapsed=20490s
+626:step 011860/12000 loss=0.3781 flow=0.3560 action=0.3804 sigma=0.2279 motion=0.0000 avg=0.2091 elapsed=20526s
+627:step 011880/12000 loss=0.1401 flow=0.1298 action=0.5955 sigma=0.7688 motion=0.0000 avg=0.2091 elapsed=20561s
+628:step 011900/12000 loss=0.1916 flow=0.1898 action=0.0376 sigma=0.3671 motion=0.0000 avg=0.2091 elapsed=20596s
+629:step 011920/12000 loss=0.3099 flow=0.2772 action=0.5951 sigma=0.2677 motion=0.0000 avg=0.2091 elapsed=20631s
+630:step 011940/12000 loss=0.4454 flow=0.4452 action=0.2162 sigma=0.9905 motion=0.0000 avg=0.2092 elapsed=20666s
+631:step 011960/12000 loss=0.1888 flow=0.1876 action=0.3488 sigma=0.9522 motion=0.0000 avg=0.2091 elapsed=20701s
+632:step 011980/12000 loss=0.1237 flow=0.1230 action=1.2124 sigma=0.9923 motion=0.0000 avg=0.2092 elapsed=20736s
+42:from so100_to_bridge_v3 import ACTION_REPRS, build_action_features  # noqa: E402
+44:# action 표현 방식. main()에서 --action-repr 로 설정한다.
+47:#   delta_base    : 로봇 base 좌표계 기준 delta 10D (기준계 후보 2, v5)
+48:#   geom_v3       : delta_base 10D + 절대 EE pose + FK 관절 위치 + 관절각 = 37D
+51:ACTION_REPR = "absolute"
+67:    return build_action_features(joints, ACTION_REPR)
+146:def build_static_segments(pipe, prompt, action_domain_id, device, dtype):
+161:def decode_and_predict_action(pipe, action_extractor, latents, pred_v, noisy_mask_v, sigma):
+295:def train_step(pipe, transformer, batch, device, dtype, scheduler, generator, action_extractor=None, action_mean=None, action_std=None, action_loss_weight=0.0,
+322:        print(f"\n[첫 스텝 진단] action_repr={ACTION_REPR}")
+323:        print(f"  bridge feature : {bridge10.shape}  (기대 {ACTION_REPR} → 폭 {bridge10.shape[1]})")
+491:    ap.add_argument("--action-loss-weight", type=float, default=0.0, help="0이면 action-following 보조 loss 비활성")
+526:    ap.add_argument("--action-repr", type=str, default="absolute", choices=ACTION_REPRS,
+531:    global ACTION_REPR, VERBOSE_FIRST_STEP
+532:    ACTION_REPR = args.action_repr
+534:    print(f"action 표현: {ACTION_REPR}")
+587:            {"params": proj_params, "lr": args.lr * args.proj_lr_mult},
+
+codex
+냉정한 결론: **아이디어는 타당하지만, “action semantics 100% 보존”은 틀렸습니다. 5k+5k를 통째로 거는 것도 권하지 않습니다.** 가장 현실적인 선택은 **Stage 1만 1–2k proof-of-life로 실행하고 체크포인트별 action intervention을 검증한 뒤 연장**하는 것입니다.
+
+1. **원리**
+
+`action_proj_*`를 freeze하면 그 모듈 자체의 forgetting은 막습니다. 그러나 action embedding을 소비하는 DiT의 LoRA가 변하므로 전체 action grounding은 여전히 약화될 수 있습니다. LoRA가 action 신호를 무시하거나 SO-100 영상 shortcut을 학습할 수 있기 때문입니다. 따라서 “경로 보존”이 아니라 **interface drift 차단**입니다.
+
+Bridge 호환성은 표현 이름이 `delta_base`라는 사실만으로 보장되지 않습니다. 좌표계, 축 부호, 단위, temporal alignment, gripper 범위를 확인해야 합니다. 가장 강한 사전 검증은 학습이 아니라 v5b base에서 동일 seed의 `GT/zero/shuffle/reverse/scaled` action 생성 비교입니다. `D(GT,zero)/D(seed)`와 gt-zero MAE를 함께 보고, GT가 zero/shuffle보다 일관되게 우세해야 합니다. Projection activation norm·분산 및 Bridge 통계 비교는 보조 진단일 뿐입니다.
+
+2. **B4 해석**
+
+`8.98→7.10`만으로 action-proj가 원인이라고 결론 내릴 수 없습니다. B4는 projection update, LoRA update, E-loss를 동시에 바꿨으므로 완전히 confounded입니다. 특히 기존 실측상 E-invdyn proxy와 hidden GRU 방향이 어긋났으므로 **E-loss 부작용도 강한 후보**입니다. Pure flow matching + frozen projection은 좋은 ablation이지만, v5b보다 좋아진다는 보장은 없습니다. 핵심 기대효과는 개선보다 **B4식 grounding 손상 방지**입니다.
+
+3. **시간**
+
+실제 Blackwell 로그는 12k가 20,736초, 즉 **5.76시간**이었습니다. 동일 설정이면 10k는 약 **4.8시간**, 5k는 2.4시간입니다. 다만 현재 워크스페이스상 job 30758은 이미 `12,000/12,000`, 2026-08-19 19:19 KST에 완료되어 있습니다. 따라서 지금은 kill trade-off가 없습니다. 컨텍스트가 다른 재실행을 뜻한다면 job ID를 재확인해야 합니다.
+
+4. **LB와 우선순위**
+
+이 방법의 현실적 분포는:
+
+- 검증 없이 5k+5k: **0.240–0.247**
+- Stage 1 조기선택 성공: **0.238–0.243**
+- 낙관적 tail: **0.235–0.238**
+
+즉 이전 Nano 예상 `0.236–0.241`을 크게 상향할 근거는 없습니다. Visual 약 0.089 벽을 구조적으로 깨는 방법도 아닙니다. 성공한다면 주로 **action 유지 + 작은 visual 적응**에서 옵니다.
+
+우선순위는 **B4+multi-seed 안전 운영 > frozen-proj Stage-1 ablation > Predict2.5 > rank128**입니다. Predict2.5는 mask/action/포맷 검증이 아직 필요하고, rank128은 forgetting 자유도를 늘립니다.
+
+5. **실행 결정**
+
+- v5b base에서 시작.
+- E-loss 없이 Stage 1 실행.
+- 500/1000/2000 step 저장.
+- 1k에서 GT-zero가 `8.98` 대비 명확히 하락하거나 visual proxy가 악화하면 즉시 폐기.
+- 2k가 양쪽 모두 유지/개선할 때만 3–5k 연장.
+- **Stage 2는 필수가 아니며 오히려 가장 위험합니다.** Stage 1이 좋으면 그대로 후보로 사용하십시오. 필요해도 projection LR은 기존 higher LR이 아니라 `0.05–0.2×`로 500–1k만 시험해야 합니다.
+- B4와 anchored CSV는 건드리지 않으므로 실패해도 방어본은 유지됩니다.
+
+따라서 이전 “검증부터” 원칙과 모순되지 않습니다. **Blackwell이 비어 있다면 5k 확정런이 아니라 1–2k gated Stage 1을 즉시 launch하는 것은 OK**입니다.
+tokens used
+33,134
+냉정한 결론: **아이디어는 타당하지만, “action semantics 100% 보존”은 틀렸습니다. 5k+5k를 통째로 거는 것도 권하지 않습니다.** 가장 현실적인 선택은 **Stage 1만 1–2k proof-of-life로 실행하고 체크포인트별 action intervention을 검증한 뒤 연장**하는 것입니다.
+
+1. **원리**
+
+`action_proj_*`를 freeze하면 그 모듈 자체의 forgetting은 막습니다. 그러나 action embedding을 소비하는 DiT의 LoRA가 변하므로 전체 action grounding은 여전히 약화될 수 있습니다. LoRA가 action 신호를 무시하거나 SO-100 영상 shortcut을 학습할 수 있기 때문입니다. 따라서 “경로 보존”이 아니라 **interface drift 차단**입니다.
+
+Bridge 호환성은 표현 이름이 `delta_base`라는 사실만으로 보장되지 않습니다. 좌표계, 축 부호, 단위, temporal alignment, gripper 범위를 확인해야 합니다. 가장 강한 사전 검증은 학습이 아니라 v5b base에서 동일 seed의 `GT/zero/shuffle/reverse/scaled` action 생성 비교입니다. `D(GT,zero)/D(seed)`와 gt-zero MAE를 함께 보고, GT가 zero/shuffle보다 일관되게 우세해야 합니다. Projection activation norm·분산 및 Bridge 통계 비교는 보조 진단일 뿐입니다.
+
+2. **B4 해석**
+
+`8.98→7.10`만으로 action-proj가 원인이라고 결론 내릴 수 없습니다. B4는 projection update, LoRA update, E-loss를 동시에 바꿨으므로 완전히 confounded입니다. 특히 기존 실측상 E-invdyn proxy와 hidden GRU 방향이 어긋났으므로 **E-loss 부작용도 강한 후보**입니다. Pure flow matching + frozen projection은 좋은 ablation이지만, v5b보다 좋아진다는 보장은 없습니다. 핵심 기대효과는 개선보다 **B4식 grounding 손상 방지**입니다.
+
+3. **시간**
+
+실제 Blackwell 로그는 12k가 20,736초, 즉 **5.76시간**이었습니다. 동일 설정이면 10k는 약 **4.8시간**, 5k는 2.4시간입니다. 다만 현재 워크스페이스상 job 30758은 이미 `12,000/12,000`, 2026-08-19 19:19 KST에 완료되어 있습니다. 따라서 지금은 kill trade-off가 없습니다. 컨텍스트가 다른 재실행을 뜻한다면 job ID를 재확인해야 합니다.
+
+4. **LB와 우선순위**
+
+이 방법의 현실적 분포는:
+
+- 검증 없이 5k+5k: **0.240–0.247**
+- Stage 1 조기선택 성공: **0.238–0.243**
+- 낙관적 tail: **0.235–0.238**
+
+즉 이전 Nano 예상 `0.236–0.241`을 크게 상향할 근거는 없습니다. Visual 약 0.089 벽을 구조적으로 깨는 방법도 아닙니다. 성공한다면 주로 **action 유지 + 작은 visual 적응**에서 옵니다.
+
+우선순위는 **B4+multi-seed 안전 운영 > frozen-proj Stage-1 ablation > Predict2.5 > rank128**입니다. Predict2.5는 mask/action/포맷 검증이 아직 필요하고, rank128은 forgetting 자유도를 늘립니다.
+
+5. **실행 결정**
+
+- v5b base에서 시작.
+- E-loss 없이 Stage 1 실행.
+- 500/1000/2000 step 저장.
+- 1k에서 GT-zero가 `8.98` 대비 명확히 하락하거나 visual proxy가 악화하면 즉시 폐기.
+- 2k가 양쪽 모두 유지/개선할 때만 3–5k 연장.
+- **Stage 2는 필수가 아니며 오히려 가장 위험합니다.** Stage 1이 좋으면 그대로 후보로 사용하십시오. 필요해도 projection LR은 기존 higher LR이 아니라 `0.05–0.2×`로 500–1k만 시험해야 합니다.
+- B4와 anchored CSV는 건드리지 않으므로 실패해도 방어본은 유지됩니다.
+
+따라서 이전 “검증부터” 원칙과 모순되지 않습니다. **Blackwell이 비어 있다면 5k 확정런이 아니라 1–2k gated Stage 1을 즉시 launch하는 것은 OK**입니다.

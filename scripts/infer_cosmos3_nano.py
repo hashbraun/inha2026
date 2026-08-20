@@ -36,6 +36,11 @@ LORA_TARGET_MODULES = [
     "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
     "mlp_moe_gen.gate_proj", "mlp_moe_gen.up_proj", "mlp_moe_gen.down_proj",
 ]
+import os as _os
+_lora_targets_env = _os.environ.get("LORA_TARGETS")
+if _lora_targets_env:
+    LORA_TARGET_MODULES = [s.strip() for s in _lora_targets_env.split(",") if s.strip()]
+    print(f"[LORA_TARGETS override] {LORA_TARGET_MODULES}", flush=True)
 
 
 def main():

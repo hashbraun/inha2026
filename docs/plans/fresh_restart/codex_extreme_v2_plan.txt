@@ -1,0 +1,224 @@
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota/inha2026
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a019dc-28dc-7843-8767-a64c1e6a7354
+--------
+user
+CONTEXT: inha2026 D-day 20h 남음 (2026-08-20 18:00 KST). 사용자가 "0.2 아래로 내릴 때까지 계속 반복"을 요구.
+현실 판단은 codex 이전 자문("realistic 0.238 근처가 상한")과 일치하지만, **사용자는 실효 있는 새 iteration을 원함**.
+치팅(kit GRU/R3D/DINO surrogate) 절대 금지.
+
+## 🔴 새 실측 결과 (핵심 신규 정보)
+
+Extreme Track top-1 w0025_cfg45_s35 실측:
+- Action mean: 0.3279 (예상 LB 0.2202)
+- **실측 LB: 0.2437** (예측 오차 +0.0235)
+- 도전본 B4 (0.2407) 대비 +0.0029 악화
+- 안전본 v5b_ANCH (0.24524) 대비 -0.0016 미미 개선
+
+Visual term 역산: 0.089 (B4) → 0.113 (cfg45). Action -0.021 (LB) vs Visual +0.024 (LB). 정확히 상쇄.
+→ **Action-Visual tradeoff 상한 실증 확정** (B4v2/Z6-B4 함정과 동일 메커니즘).
+
+## Pareto 결과 (자체 clean-room, 실측 반영 재해석)
+
+REF b4_step6000 (LB 0.2407): e-inv L1=41.953, alex_cos=1.0, ff_l2=7.27
+
+| 후보 | Action | pred_LB | e-inv | alex_cos | 재예측 LB | 실측 |
+|---|---|---|---|---|---|---|
+| w0025_cfg45_s35 | 0.3279 | 0.2202 | -0.41 | 0.9570 | 0.244 | **0.2437** |
+| interp_b4_w0025_a25 | 0.3322 | 0.2219 | -0.50 | 0.9585 | 0.245 | - |
+| interp_b4_w0025_a50 | 0.3397 | 0.2249 | -0.15 | 0.9591 | 0.248 | - |
+| interp_b4_w0025_a75 | 0.3464 | 0.2276 | -0.07 | 0.9595 | 0.250 | - |
+| interp_v5b_w0025_a50 | 0.3833 | 0.2423 | -0.15 | 0.9537 | 0.269 | - |
+
+alex_cos-based visual damage 회귀식: visual ≈ 0.089 + 0.56·(1-alex_cos)
+→ 모든 extreme 후보 예상 0.244~0.269, B4 능가 불가.
+
+## 진행 중 실험
+
+### 방향 확장 v2 (6잡 launched at 20:41, ~30분 후 완료 예상)
+- exp2_w0025_cfg30_s35 (더 낮은 CFG)
+- exp2_w0025_cfg35_s35
+- exp2_interp_a10_cfg60 (더 극단 interp)
+- exp2_interp_a05_cfg60
+- exp2_interp_a25_cfg45 (콤보)
+- exp2_interp_a10_cfg45 (극극 콤보)
+
+### 기타 진행
+- w005 sweep 5개 완료: best step12000 Action 0.3710 pred_LB 0.2374 (실측 없이는 아마 0.247급)
+- w0075 sweep 5잡 running (약 30분 후)
+- Blackwell 학습 30758 w0075 계속
+
+## 재활용 가능 자산
+
+- Wan2.2-TI2V-5B: /home1/sota/inha2026/models/wan22_ti2v_5b/ (I2V mode, 24GB inference)
+- 자체 clean-room predictors:
+  - E InverseDynamicsPredictor (ConvNeXt-Small+temporal, 20k step, avg l1 0.129)
+  - AlexNet feature (ImageNet, kit 무관)
+- Cosmos3-Nano v5 base 20k, B4 series, w0025/w005/w0075 sweep 다수 ckpt
+- fresh_invdyn/invdyn_step020000.pt
+
+## 규정 재확인 (엄격)
+- kit GRU / R3D-18 / DINOv2 학습/inference/selection/후처리 절대 금지
+- kit backbone 별도 다운로드 surrogate 금지 (R3D-18/DINOv2-대체를 새로 다운로드해서 loss 안 됨)
+- 생성 mp4 수정해서 kit judge 통과 목적 금지 (TTO 사례)
+- **허용**: 외부 pretrained (Wan/Cosmos), 자체 clean-room predictor (E-invdyn), inference-time tricks (CFG/sampler/seed)
+
+## 이미 폐기된 접근 (재시도 무의미)
+- P2 mp4 후처리 (RIFE/FILM/SR): 규정 위반 판정
+- B4v2/Z6-B4: visual 손상
+- Cosmos-Predict2.5: G5 FAIL
+- Track A-E: 실패
+- Wan2.1-Fun, SVD, DynamiCrafter, HunyuanVideo, CogVideoX2, Open-Sora Plan2: 폐기
+
+## 요청 (brutally honest, 500 words 이내)
+
+사용자 목표 **LB < 0.2**. 이건 -0.04 개선, TTO(kit surrogate)만이 이 폭 달성했고 그건 규정 위반.
+
+1. **realistic ceiling 재확인**: 규정 클린 방법으로 20h 남은 상황에서 도달 가능한 LB 하한은?
+   - 0.24 벽 넘을 수 있는가?
+   - 0.22 실현 가능한가?
+   - 0.20 완전 불가능 사유는?
+
+2. **자체 predictor 기반 self-TTO** (clean-room):
+   - 우리 E-invdyn를 reward로 각 sample 별 CFG/seed sweep
+   - 시간 예산 within 5h?
+   - upside 얼마?
+
+3. **Multi-seed ensemble** (E-invdyn selection):
+   - 우리 이미 e_select 시도 0.263 (v5b_ANCH 대비 악화)
+   - 재시도 가치? 어떻게 변형?
+
+4. **Wan2.2-TI2V-5B zero-shot I2V pilot**:
+   - Codex 이전 판정 "+0.01 악화" 근거는 6-DoF grounding 부재
+   - action 무시 배경으로 그냥 첫프레임 조건만 → naturalness/motion coherence 강할 수 있음
+   - visual term 0.089→0.05로 낮출 가능성 있는가?
+   - 12-24개 pilot 어떤 metric으로 kill 판정?
+
+5. **놓친 극단 방향** (지금까지 안 해본 것):
+   - Ensemble at latent (VAE decode 전)
+   - Multi-scale generation (저해상도 → 업샘플 우리 자체)
+   - Multi-step refinement (2회 denoise)
+   - Reference-video conditioning (first-frame + few-frame extrap)
+   - 다른 것?
+
+6. **연속 iteration 자동화**:
+   - 사용자 KILL까지 무한 loop, wave 완료마다 새 candidate 자동 queue
+   - 어떤 새 candidate 후보를 queue에 계속 넣어야 하나?
+   - Codex 자문 자동 통합 유지
+
+우선순위 top-3 즉시 launch용 명확히. 새 학습 launch 필요하면 시간 예산 명시.
+"""
+
+codex
+냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+
+1. 현실적 ceiling
+
+- **0.24 돌파:** 가능하지만 소폭입니다. B4 0.2407에서 clean selection/seed luck으로 0.002–0.005 개선 여지가 있습니다.
+- **0.22:** 현 증거상 비현실적입니다. Action을 줄일수록 visual이 거의 같은 폭으로 악화되는 Pareto 벽이 실측됐습니다. 달성하려면 현재 생성분포 자체를 바꾸는 새 모델이 필요합니다.
+- **0.20:** 사실상 불가능합니다. 필요한 -0.0407은 현재 clean iteration의 예상 이득보다 한 자릿수 이상 큽니다. 그 폭을 보인 유일한 방법이 금지된 kit-surrogate TTO였다는 점도 강한 반증입니다.
+
+2. E-invdyn self-TTO
+
+해볼 가치는 있지만 **최적화가 아니라 제한된 reranking**이어야 합니다. E reward만 최소화하면 cfg45처럼 visual 손상을 선택합니다.
+
+점수는 예를 들어:
+
+`score = predicted_action + 0.56*(1-alex_cos) + temporal/artifact penalty`
+
+각 sample에 B4 계열 중심으로 4–8개 후보만 생성하고, E 개선이 있으면서 `alex_cos ≥ 0.985` 또는 기준 대비 visual 예측 악화 ≤0.003인 후보만 채택하십시오. 총 생성량이 기존 한 번의 4–8배라면 5시간 내 가능 여부는 **현재 full-eval inference 시간 × 배수**로 결정됩니다. 기대 upside는 **0.001–0.004**, 낙관적 최대 약 0.006입니다.
+
+3. Multi-seed ensemble
+
+기존 e_select 0.263 때문에 **E-only 재시도는 폐기**입니다. 변형 가치는 “sample별 gated replacement”에만 있습니다.
+
+- 기본 출력은 B4 유지
+- 후보가 action 예측 ≥0.01 개선
+- alex/temporal 기준 통과
+- seed 간 E 예측 합의가 있을 때만 교체
+
+전체 샘플 중 10–30%만 교체하십시오.
+
+4. Wan2.2 pilot
+
+Visual 0.089→0.05는 **가능성이 매우 낮습니다**. 자연스러움은 좋아져도 action-conditioned 6-DoF 정합 실패가 Action을 크게 올릴 가능성이 큽니다. 그래도 12개로 빠른 kill test는 타당합니다.
+
+Kill 기준:
+
+- 자체 E Action이 B4보다 평균 `>+0.02`면 즉시 중단
+- first-frame/identity drift 또는 camera-motion mismatch가 25% 초과면 중단
+- Alex visual proxy 개선이 `<0.02`면 중단
+- 12개 통과 시에만 24개 확장
+
+5. 놓친 방향
+
+Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+
+즉시 launch Top-3:
+
+1. **B4-centered constrained multi-seed self-TTO** — 4–8 seeds, 3–5시간, 최우선  
+2. **Wan 12-sample kill pilot** — 1–2시간 상한  
+3. **Late-step latent refinement micro-sweep** — 6–9 설정, 2–3시간  
+
+자동 loop는 매 wave마다 predictor 보정 → Pareto filter → 가장 불확실한 CFG/seed/refinement 후보 queue 순으로 돌리되, **두 wave 연속 예상 개선 <0.001이면 해당 축을 KILL**해야 합니다. “무한 반복”은 가능하지만 새 정보 없는 반복은 계산만 태웁니다.
+tokens used
+5,982
+냉정한 결론: 현재 규정과 20시간 제약에서 **현실적 최저 LB는 0.237–0.241**, 운 좋은 outlier까지 포함해도 **약 0.234**입니다.
+
+1. 현실적 ceiling
+
+- **0.24 돌파:** 가능하지만 소폭입니다. B4 0.2407에서 clean selection/seed luck으로 0.002–0.005 개선 여지가 있습니다.
+- **0.22:** 현 증거상 비현실적입니다. Action을 줄일수록 visual이 거의 같은 폭으로 악화되는 Pareto 벽이 실측됐습니다. 달성하려면 현재 생성분포 자체를 바꾸는 새 모델이 필요합니다.
+- **0.20:** 사실상 불가능합니다. 필요한 -0.0407은 현재 clean iteration의 예상 이득보다 한 자릿수 이상 큽니다. 그 폭을 보인 유일한 방법이 금지된 kit-surrogate TTO였다는 점도 강한 반증입니다.
+
+2. E-invdyn self-TTO
+
+해볼 가치는 있지만 **최적화가 아니라 제한된 reranking**이어야 합니다. E reward만 최소화하면 cfg45처럼 visual 손상을 선택합니다.
+
+점수는 예를 들어:
+
+`score = predicted_action + 0.56*(1-alex_cos) + temporal/artifact penalty`
+
+각 sample에 B4 계열 중심으로 4–8개 후보만 생성하고, E 개선이 있으면서 `alex_cos ≥ 0.985` 또는 기준 대비 visual 예측 악화 ≤0.003인 후보만 채택하십시오. 총 생성량이 기존 한 번의 4–8배라면 5시간 내 가능 여부는 **현재 full-eval inference 시간 × 배수**로 결정됩니다. 기대 upside는 **0.001–0.004**, 낙관적 최대 약 0.006입니다.
+
+3. Multi-seed ensemble
+
+기존 e_select 0.263 때문에 **E-only 재시도는 폐기**입니다. 변형 가치는 “sample별 gated replacement”에만 있습니다.
+
+- 기본 출력은 B4 유지
+- 후보가 action 예측 ≥0.01 개선
+- alex/temporal 기준 통과
+- seed 간 E 예측 합의가 있을 때만 교체
+
+전체 샘플 중 10–30%만 교체하십시오.
+
+4. Wan2.2 pilot
+
+Visual 0.089→0.05는 **가능성이 매우 낮습니다**. 자연스러움은 좋아져도 action-conditioned 6-DoF 정합 실패가 Action을 크게 올릴 가능성이 큽니다. 그래도 12개로 빠른 kill test는 타당합니다.
+
+Kill 기준:
+
+- 자체 E Action이 B4보다 평균 `>+0.02`면 즉시 중단
+- first-frame/identity drift 또는 camera-motion mismatch가 25% 초과면 중단
+- Alex visual proxy 개선이 `<0.02`면 중단
+- 12개 통과 시에만 24개 확장
+
+5. 놓친 방향
+
+Latent averaging, 저해상도 생성, 2회 denoise는 대체로 blur/drift를 만들어 기대값이 낮습니다. 그중 유일하게 시험할 것은 **B4 latent에 아주 작은 late-step refinement**입니다: 마지막 5–10% 구간, low noise, 2–3 strength만. Reference-video conditioning은 새 학습/파이프라인 위험이 커서 20시간 내 비추천입니다.
+
+즉시 launch Top-3:
+
+1. **B4-centered constrained multi-seed self-TTO** — 4–8 seeds, 3–5시간, 최우선  
+2. **Wan 12-sample kill pilot** — 1–2시간 상한  
+3. **Late-step latent refinement micro-sweep** — 6–9 설정, 2–3시간  
+
+자동 loop는 매 wave마다 predictor 보정 → Pareto filter → 가장 불확실한 CFG/seed/refinement 후보 queue 순으로 돌리되, **두 wave 연속 예상 개선 <0.001이면 해당 축을 KILL**해야 합니다. “무한 반복”은 가능하지만 새 정보 없는 반복은 계산만 태웁니다.

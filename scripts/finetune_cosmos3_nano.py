@@ -88,6 +88,11 @@ LORA_TARGET_MODULES = [
     "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
     "mlp_moe_gen.gate_proj", "mlp_moe_gen.up_proj", "mlp_moe_gen.down_proj",
 ]
+# LORA_TARGETS env var override (attention scope 실험용)
+_lora_targets_env = os.environ.get("LORA_TARGETS")
+if _lora_targets_env:
+    LORA_TARGET_MODULES = [s.strip() for s in _lora_targets_env.split(",") if s.strip()]
+    print(f"[LORA_TARGETS override] {LORA_TARGET_MODULES}", flush=True)
 
 
 class SO100ClipDataset(torch.utils.data.Dataset):
@@ -330,7 +335,30 @@ def train_step(pipe, transformer, batch, device, dtype, scheduler, generator, ac
         print(flush=True)
 
     # 3) flow-matching 노이즈: vision은 frame0 제외 전부 noisy, action은 전부 clean(forward_dynamics)
-    idx = random.randrange(len(scheduler.timesteps))
+    # ---- Timestep sigma sampling ----
+    # 기본: uniform (기존 동작, scheduler median σ=0.929 高노이즈 편중)
+    # 대안: Beta(a,b) or logit-normal(mean_shift, scale) → 중저노이즈 편향
+    #   Beta(2,2) → 중앙 편향, Beta(1,7) → 저노이즈 dominant, Beta(7,1) → 高노이즈
+    #   logit-normal shift<0 → 저노이즈 편향, shift>0 → 고노이즈 편향 (predict2.5 default shift=5)
+    sigma_mode = os.environ.get("SIGMA_MODE", "uniform")
+    n_ts = len(scheduler.timesteps)
+    # scheduler.sigmas는 n+1 개 (flow matching: n step + trailing zero). timesteps 인덱스 범위로 자른다.
+    if sigma_mode == "beta":
+        a = float(os.environ.get("SIGMA_BETA_A", "2.0"))
+        b = float(os.environ.get("SIGMA_BETA_B", "2.0"))
+        u = float(torch.distributions.Beta(a, b).sample())
+        sig_arr = scheduler.sigmas.detach().cpu().float().numpy()[:n_ts]
+        idx = int(np.argmin(np.abs(sig_arr - u)))
+    elif sigma_mode == "logit_normal":
+        shift = float(os.environ.get("SIGMA_LN_SHIFT", "0.0"))
+        scale = float(os.environ.get("SIGMA_LN_SCALE", "1.0"))
+        z = float(torch.randn(()).item())
+        u = 1.0 / (1.0 + np.exp(-(z * scale + shift)))
+        sig_arr = scheduler.sigmas.detach().cpu().float().numpy()[:n_ts]
+        idx = int(np.argmin(np.abs(sig_arr - u)))
+    else:
+        idx = random.randrange(n_ts)
+    idx = min(idx, n_ts - 1)
     sigma = scheduler.sigmas[idx].to(device=device, dtype=torch.float32)
     timestep = scheduler.timesteps[idx]
 
@@ -555,9 +583,15 @@ def main():
     if freeze_lora:
         print(f"[FREEZE_LORA=1] LoRA 파라미터 {len(lora_params)}개 freeze — action_proj/embed만 학습", flush=True)
 
-    transformer.action_proj_in.requires_grad_(True)
-    transformer.action_proj_out.requires_grad_(True)
-    transformer.action_modality_embed.requires_grad_(True)
+    # FREEZE_ACTION_PATH=1 → action_proj_in/out + action_modality_embed freeze (Stage 1 gated frozen-proj 실험)
+    # Codex 자문: interface drift는 여전히 발생 가능 (DiT LoRA가 여전히 학습). 완전 grounding 보존 불가.
+    # 그러나 projection 자체의 catastrophic forgetting은 차단.
+    freeze_action_path = os.environ.get("FREEZE_ACTION_PATH", "0") == "1"
+    transformer.action_proj_in.requires_grad_(not freeze_action_path)
+    transformer.action_proj_out.requires_grad_(not freeze_action_path)
+    transformer.action_modality_embed.requires_grad_(not freeze_action_path)
+    if freeze_action_path:
+        print("[FREEZE_ACTION_PATH=1] action_proj_in/out + action_modality_embed FROZEN — DiT LoRA만 학습", flush=True)
     proj_params = list(transformer.action_proj_in.parameters()) + list(transformer.action_proj_out.parameters()) + [transformer.action_modality_embed]
 
     if args.resume:
@@ -581,12 +615,11 @@ def main():
     n_proj = sum(p.numel() for p in proj_params)
     print(f"Trainable: LoRA={n_lora/1e6:.2f}M  action_proj/embed={n_proj/1e6:.2f}M")
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": lora_params, "lr": args.lr},
-            {"params": proj_params, "lr": args.lr * args.proj_lr_mult},
-        ]
-    )
+    # FREEZE_ACTION_PATH=1이면 proj group을 optimizer에 넣지 않는다 (0 lr trick 대신 완전 제외)
+    param_groups = [{"params": lora_params, "lr": args.lr}]
+    if not freeze_action_path:
+        param_groups.append({"params": proj_params, "lr": args.lr * args.proj_lr_mult})
+    optimizer = torch.optim.AdamW(param_groups)
 
     scheduler = pipe.scheduler
     scheduler.set_timesteps(1000, device=device)

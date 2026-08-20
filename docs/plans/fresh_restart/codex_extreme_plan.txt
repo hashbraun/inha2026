@@ -1,0 +1,1050 @@
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a018ff-2b82-7852-971c-793fb57ec0bd
+--------
+user
+CONTEXT: inha2026 D-day 임박 (2026-08-20 18:00 KST 마감, 약 26h 남음).
+사용자가 지금까지의 auto loop v2 접근으로는 리더보드 대폭 개선이 어렵다고 판단하여
+"극단적/새로운 방법을 병렬로 시도"하기로 결정. 시간 제약 무시. 치팅(규정 위반)만 아니면 OK.
+
+당신 역할: 이 파일 하나만 읽고 냉정하게 판단. 이전 자문 파일들도 확인:
+- /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick40.txt
+- /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt
+- /home1/sota/inha2026/docs/plans/fresh_restart/RULES_v3_FINAL.md
+- /home1/sota/inha2026/baseline/IMPLEMENTATION_NOTES.md
+필요 시 위 파일들 grep/read.
+
+## 채점 및 실측 자산
+- 채점: 0.3·(1-DINO_cos) + 0.3·(1-Video_cos R3D-18) + 0.4·Action_MAE (lower=better)
+- 실측 안전본: v5b_ANCHORED_soft.csv = 0.24524
+- 실측 도전본: submission_b4_step6000.csv = 0.2407
+- 실측 실패: B4v2 = 0.2508 (visual +0.010 손상), Z6-B4 hybrid = 0.2499
+- 예측 최고 미실측: b4_sw_w0025 step12000 Action=0.3647 (예측 LB 0.2349)
+- 진행중 학습: b4_sw_w005 (12k target, step8000까지 저장), b4_sw_w0075 (step5000까지)
+
+## 재활용 가능 자산 (이미 클러스터에 있음)
+- Wan2.2-TI2V-5B: /home1/sota/inha2026/models/wan22_ti2v_5b/ (safetensors 3-part + VAE + T5)
+- Wan2.1-Fun-Control (Blackwell smoke 통과: 50.2s 21.5GB peak, 49f 480x832)
+- Cosmos-Predict2.5-2B: /home1/sota/inha2026/models/predict2.5_action_cond/ (4.25GB, G5 falsification FAIL 이력)
+- Cosmos3-Nano v5 base 20k step: /home1/sota/inha2026/checkpoints/cosmos3_nano_v5_base/ckpt_step020000.pt
+- 자체 clean-room predictors: E InverseDynamicsPredictor (ConvNeXt-Small+temporal, 20k step, avg l1 0.129)
+
+## 클러스터 자원 (현 시점)
+- gpu-113 Blackwell 95GB: 30757/30758 두 학습잡 사용중 (약 11~12h 남음)
+- gpu-108~112 A6000_ada 48GB×8×4nodes: 여유 (몇 잡만 running)
+- gpu-107 p6000 24GB×10: qwen 서브 (다른 사용자)
+- inha2026 (torch 2.6+cu124) / inha2026_bw (torch 2.15dev+cu130) env
+
+## 규정 (엄격, 위반 시 실격)
+- kit GRU / R3D-18 / DINOv2 를 loss/selection/mp4 수정에 사용 금지
+- kit backbone 별도 다운로드해서 surrogate로 사용 금지
+- CSV 스코어 보고 seed 선택 금지 (Codex v5 지적)
+- 생성 mp4를 kit judge 통과 목적으로 수정 금지 (TTO는 이 이유로 실격, 실측 0.04)
+- 허용: 외부 pretrained backbone, 자체 clean-room predictor, inference-only tricks (CFG/sampler/steps), first-frame anchor
+
+## 이미 시도해서 확정 실패
+- Track A (Cosmos-Predict2.5): G5 falsification 2회 FAIL
+- Track B (FiLM adapter): mean-motion prior 로 수렴, action-selective signal 없음
+- Track C (Cosmos3-Edge-Policy-DROID): d7=SO100 domain 미학습 (zero-init)
+- Track D (Fresh DiT scratch): 학습 수렴 불가
+- Track E (skeleton warping): TTO 계열, 규정 위반
+- B4v2 (constant weight): visual 손상 +0.010 → LB 악화
+- Z6-B4 hybrid: 82M adapter + 장기학습 visual 손상
+- Wan2.1-Fun / HunyuanVideo / SVD / DynamiCrafter / CogVideoX2 / Open-Sora Plan2 : 미검증 or 구식
+- Cosmos-Predict2.5: backbone action-agnostic (G5)
+
+## 사용자 초안 4트랙 (내 제안, 검토 필요)
+- **P1 Inference tricks (즉시, 학습 무관)**: CFG scale sweep, sampler 교체(DPM++/Heun/Euler-a),
+  sampling steps 50→200, karras noise schedule, first-frame stronger anchor (초기 latent 강제),
+  zero-action / GT-action / shuffled-action 3-way ablation
+- **P2 Post-processing**: RIFE/FILM temporal interpolation, VideoLDM-style denoising,
+  mild super-resolution, first-frame paste-back, color-match  → 규정 회색 (mp4 수정 판정?)
+- **P3 Zero-shot 다른 backbone I2V**: Wan2.2-A14B / DreamZero 14B / Cosmos-Predict2.5 base zero-shot
+  으로 원본 첫 프레임 조건 216 sample inference (학습 없음)
+- **P4 Ensemble**: 여러 CSV의 per-sample best (자체 E invdyn score 기반), pixel/latent blend
+
+## 필요한 자문 (roundtable, brutally honest, 500 words 이내 OK)
+
+1. **P1~P4 각각의 realistic upside** (LB 몇 만큼 개선? 0.24524 대비 -0.005 / -0.01 / -0.02 어느 급?)
+   특히 이전 sweep 결과와 실패 이력 감안 시.
+
+2. **P2 규정 판정**: RIFE/FILM post-processing 이 "mp4 수정 금지" 조항에 걸리는가?
+   실무적으로 "생성 파이프라인의 일부"인지 "kit judge 회피 조작"인지 판단 근거.
+
+3. **놓친 극단 시도**가 있는가? (지금까지 대회에서 안 해본 것 중 realistic upside가 있는 것)
+   예시로 검토해봤으면 하는 카테고리:
+   - RAFT/optical flow 조건화 (미시도)
+   - Multi-model latent-space ensemble (VAE latent에서 blend)
+   - Reference frame conditioning (16f 생성이 아니라 T=1 초생성 → 15개 재조건화 재귀 생성)
+   - CFG++ / STG (Spatial-Temporal Guidance) 최신 sampling trick
+   - Test-time diffusion refinement (kit 안 쓰고 자체 R3D/DINO clone 학습)
+   - Video inpainting mask-based first-few-frames GT copy
+   - GT-video-guided score distillation (예측 v_pred을 GT frame 방향으로 nudge, 학습 없음)
+   - 다른 것?
+
+4. **우선순위 top-3** (즉시 launch 순서). 병렬 리소스: A6000_ada 48GB 6~8잡 여유.
+
+5. **폐기해야 할 트랙**: 위 4트랙 or 놓친 극단 중 착수 자체가 시간 낭비인 것.
+
+6. **자동화 아키텍처**: 이 극단 실험들을 auto_loop_v2 candidate queue 에 얹을지,
+   별도 auto_loop_extreme.py 를 짤지. 각 트랙 done 판정 metric은 무엇이어야 하는가?
+   (Action mean + 자체 E invdyn L1 조합? 다른 proxy?)
+
+7. **실측 slot 예산 배분**: 남은 Dacon slot 이 N개(사용자 확인 필요)라 할 때
+   극단 트랙별 slot 몇 개씩이 realistic?
+
+이전 자문 (`codex_pivot_tick40.txt`, `codex_pivot_tick8.txt`, `codex_z5.txt`, `codex_z6.txt`, `codex_v7.txt`)
+와 모순되지 않도록 재확인. 이전 자문의 "새 학습 자제 / 6-10h 검증 버퍼 확보" 원칙과의 tradeoff 명시.
+
+codex
+요청하신 이전 자문과 규정/구현 메모를 먼저 대조하겠습니다. 특히 과거 sweep의 실제 수치, “mp4 수정” 금지 문구, 현재 proxy의 신뢰도를 근거로 500단어 안쪽의 냉정한 우선순위를 내리겠습니다.
+exec
+/bin/bash -lc "wc -l /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick40.txt /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt /home1/sota/inha2026/docs/plans/fresh_restart/RULES_v3_FINAL.md /home1/sota/inha2026/baseline/IMPLEMENTATION_NOTES.md /home1/sota/inha2026/docs/plans/fresh_restart/codex_z5.txt /home1/sota/inha2026/docs/plans/fresh_restart/codex_z6.txt /home1/sota/inha2026/docs/plans/fresh_restart/codex_v7.txt 2>&1 && sed -n '1,240p' /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick40.txt && sed -n '1,240p' /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt" in /home1/sota
+ succeeded in 0ms:
+  1172 /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick40.txt
+  1060 /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt
+   175 /home1/sota/inha2026/docs/plans/fresh_restart/RULES_v3_FINAL.md
+   359 /home1/sota/inha2026/baseline/IMPLEMENTATION_NOTES.md
+  1059 /home1/sota/inha2026/docs/plans/fresh_restart/codex_z5.txt
+   717 /home1/sota/inha2026/docs/plans/fresh_restart/codex_z6.txt
+   555 /home1/sota/inha2026/docs/plans/fresh_restart/codex_v7.txt
+  5097 total
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota/inha2026
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a018a8-9232-73c3-aaf3-216a891658b5
+--------
+user
+CONTEXT: inha2026 D-day 임박. Auto loop v2 tick 40 pivot 시점.
+
+## 이벤트
+marginal: b4_sw_w0025 best 0.3647 (vs B4 -0.0151)
+
+## 실측 확정
+- v5b_ANCH: 0.24524 (안전본)
+- B4 step6000: 0.2407 (도전본)
+- B4v2: 0.2508 (실패)
+- Z6-B4 hybrid: 0.2499 (실패)
+
+## Auto loop 최근 로그
+```
+[2026-08-19T08:28:44] ============================================================
+[2026-08-19T08:28:44] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:28:44] --- tick 1 ---
+[2026-08-19T08:34:23] ============================================================
+[2026-08-19T08:34:23] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:34:23] --- tick 1 ---
+[2026-08-19T08:44:23] --- tick 2 ---
+[2026-08-19T08:44:49] ============================================================
+[2026-08-19T08:44:49] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:44:49] --- tick 1 ---
+[2026-08-19T08:54:49] --- tick 2 ---
+[2026-08-19T09:04:49] --- tick 3 ---
+[2026-08-19T09:14:49] --- tick 4 ---
+[2026-08-19T09:24:49] --- tick 5 ---
+[2026-08-19T09:34:49] --- tick 6 ---
+[2026-08-19T09:44:49] --- tick 7 ---
+[2026-08-19T09:54:49] --- tick 8 ---
+[2026-08-19T09:54:50] [b4_original_1000] Action=0.3868 (vs B4 +0.0070)
+[2026-08-19T09:54:50] [b4_original_1500] Action=0.3758 (vs B4 -0.0040)
+[2026-08-19T09:54:50] [event] marginal: b4_original_1500 Action=0.3758
+[2026-08-19T09:54:50] [b4_original_5500] Action=0.3785 (vs B4 -0.0013)
+[2026-08-19T09:54:50] [event] marginal: b4_original_5500 Action=0.3785
+[2026-08-19T09:54:50] [codex] pivot tick8 launched → /home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt
+[2026-08-19T10:04:50] --- tick 9 ---
+[2026-08-19T10:14:51] --- tick 10 ---
+[2026-08-19T10:24:51] --- tick 11 ---
+[2026-08-19T10:34:51] --- tick 12 ---
+[2026-08-19T10:44:51] --- tick 13 ---
+[2026-08-19T10:54:51] --- tick 14 ---
+[2026-08-19T11:04:51] --- tick 15 ---
+[2026-08-19T11:14:51] --- tick 16 ---
+[2026-08-19T11:24:51] --- tick 17 ---
+[2026-08-19T11:34:51] --- tick 18 ---
+[2026-08-19T11:44:51] --- tick 19 ---
+[2026-08-19T11:54:51] --- tick 20 ---
+[2026-08-19T12:04:51] --- tick 21 ---
+[2026-08-19T12:14:51] --- tick 22 ---
+[2026-08-19T12:24:51] --- tick 23 ---
+[2026-08-19T12:34:51] --- tick 24 ---
+[2026-08-19T12:44:51] --- tick 25 ---
+[2026-08-19T12:54:51] --- tick 26 ---
+[2026-08-19T13:04:51] --- tick 27 ---
+[2026-08-19T13:14:51] --- tick 28 ---
+[2026-08-19T13:24:51] --- tick 29 ---
+[2026-08-19T13:34:51] --- tick 30 ---
+[2026-08-19T13:34:51] [b4_sw_w0025] ckpt_step004000.pt inf job 30817 launched
+[2026-08-19T13:34:51] [b4_sw_w0025] ckpt_step006000.pt inf job 30818 launched
+[2026-08-19T13:34:51] [b4_sw_w0025] ckpt_step008000.pt inf job 30819 launched
+[2026-08-19T13:34:51] [b4_sw_w0025] ckpt_step010000.pt inf job 30820 launched
+[2026-08-19T13:34:51] [b4_sw_w0025] ckpt_step012000.pt inf job 30821 launched
+[2026-08-19T13:44:51] --- tick 31 ---
+[2026-08-19T13:54:52] --- tick 32 ---
+[2026-08-19T14:04:52] --- tick 33 ---
+[2026-08-19T14:14:52] --- tick 34 ---
+[2026-08-19T14:24:52] --- tick 35 ---
+[2026-08-19T14:34:52] --- tick 36 ---
+[2026-08-19T14:44:52] --- tick 37 ---
+[2026-08-19T14:54:52] --- tick 38 ---
+[2026-08-19T15:04:52] --- tick 39 ---
+[2026-08-19T15:14:52] --- tick 40 ---
+[2026-08-19T15:14:53] [b4_sw_w0025] ckpt_step004000.pt: Action=0.3803
+[2026-08-19T15:14:53] [b4_sw_w0025] ckpt_step006000.pt: Action=0.3775
+[2026-08-19T15:14:53] [b4_sw_w0025] ckpt_step008000.pt: Action=0.3790
+[2026-08-19T15:14:53] [b4_sw_w0025] ckpt_step010000.pt: Action=0.3737
+[2026-08-19T15:14:54] [b4_sw_w0025] ckpt_step012000.pt: Action=0.3647
+[2026-08-19T15:14:54] [event] marginal: b4_sw_w0025 best 0.3647 (vs B4 -0.0151)
+```
+
+## State snapshot
+```json
+{
+  "started": "2026-08-19T08:44:49",
+  "candidates": {
+    "b4_sw_w0025": {
+      "job_id": 30749,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w0025",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.025",
+      "phase": "marginal",
+      "results": {
+        "ckpt_step004000.pt": {
+          "mean": 0.38025443592212266,
+          "median": 0.35207299888134,
+          "predicted_lb": 0.24110177436884908
+        },
+        "ckpt_step006000.pt": {
+          "mean": 0.3775130001724594,
+          "median": 0.3504755049943924,
+          "predicted_lb": 0.24000520006898377
+        },
+        "ckpt_step008000.pt": {
+          "mean": 0.37903587085505325,
+          "median": 0.3377690017223358,
+          "predicted_lb": 0.2406143483420213
+        },
+        "ckpt_step010000.pt": {
+          "mean": 0.3736616397724935,
+          "median": 0.33145199716091156,
+          "predicted_lb": 0.2384646559089974
+        },
+        "ckpt_step012000.pt": {
+          "mean": 0.3646986058533744,
+          "median": 0.32359549403190613,
+          "predicted_lb": 0.23487944234134975
+        }
+      },
+      "inf_jobs": {
+        "ckpt_step004000.pt": {
+          "done": true,
+          "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_sw_w0025_step4000.csv"
+        },
+        "ckpt_step006000.pt": {
+          "done": true,
+          "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_sw_w0025_step6000.csv"
+        },
+        "ckpt_step008000.pt": {
+          "done": true,
+          "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_sw_w0025_step8000.csv"
+        },
+        "ckpt_step010000.pt": {
+          "done": true,
+          "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_sw_w0025_step10000.csv"
+        },
+        "ckpt_step012000.pt": {
+          "done": true,
+          "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_sw_w0025_step12000.csv"
+        }
+      },
+      "best": {
+        "mean": 0.3646986058533744,
+        "median": 0.32359549403190613,
+        "predicted_lb": 0.23487944234134975,
+        "ckpt": "ckpt_step012000.pt"
+      }
+    },
+    "b4_sw_w005": {
+      "job_id": 30757,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w005",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.05 (=B4 성공 setting 재현)",
+      "phase": "training",
+      "results": {},
+      "inf_jobs": {}
+    },
+    "b4_sw_w0075": {
+      "job_id": 30758,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w0075",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.075",
+      "phase": "training",
+      "results": {},
+      "inf_jobs": {}
+    },
+    "b4_original_1000": {
+      "job_id": 30759,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step1000.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+        "mean": 0.3867979595023725,
+        "median": 0.3490374982357025,
+        "predicted_lb": 0.243719183800949
+      }
+    },
+    "b4_original_1500": {
+      "job_id": 30760,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step1500.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+        "mean": 0.37584324965805366,
+        "median": 0.33896900713443756,
+        "predicted_lb": 0.23933729986322147
+      }
+    },
+    "b4_original_5500": {
+      "job_id": 30761,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step5500.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota/inha2026
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 01a01783-8ce6-7301-8ac3-5c37e049f143
+--------
+user
+CONTEXT: inha2026 D-day 임박. Auto loop v2 tick 8 pivot 시점.
+
+## 이벤트
+marginal: b4_original_1500 Action=0.3758 | marginal: b4_original_5500 Action=0.3785
+
+## 실측 확정
+- v5b_ANCH: 0.24524 (안전본)
+- B4 step6000: 0.2407 (도전본)
+- B4v2: 0.2508 (실패)
+- Z6-B4 hybrid: 0.2499 (실패)
+
+## Auto loop 최근 로그
+```
+[2026-08-19T08:28:44] ============================================================
+[2026-08-19T08:28:44] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:28:44] --- tick 1 ---
+[2026-08-19T08:34:23] ============================================================
+[2026-08-19T08:34:23] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:34:23] --- tick 1 ---
+[2026-08-19T08:44:23] --- tick 2 ---
+[2026-08-19T08:44:49] ============================================================
+[2026-08-19T08:44:49] Auto loop v2 START (codex pivot integration)
+[2026-08-19T08:44:49] --- tick 1 ---
+[2026-08-19T08:54:49] --- tick 2 ---
+[2026-08-19T09:04:49] --- tick 3 ---
+[2026-08-19T09:14:49] --- tick 4 ---
+[2026-08-19T09:24:49] --- tick 5 ---
+[2026-08-19T09:34:49] --- tick 6 ---
+[2026-08-19T09:44:49] --- tick 7 ---
+[2026-08-19T09:54:49] --- tick 8 ---
+[2026-08-19T09:54:50] [b4_original_1000] Action=0.3868 (vs B4 +0.0070)
+[2026-08-19T09:54:50] [b4_original_1500] Action=0.3758 (vs B4 -0.0040)
+[2026-08-19T09:54:50] [event] marginal: b4_original_1500 Action=0.3758
+[2026-08-19T09:54:50] [b4_original_5500] Action=0.3785 (vs B4 -0.0013)
+[2026-08-19T09:54:50] [event] marginal: b4_original_5500 Action=0.3785
+```
+
+## State snapshot
+```json
+{
+  "started": "2026-08-19T08:44:49",
+  "candidates": {
+    "b4_sw_w0025": {
+      "job_id": 30749,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w0025",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.025",
+      "phase": "training",
+      "results": {},
+      "inf_jobs": {}
+    },
+    "b4_sw_w005": {
+      "job_id": 30757,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w005",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.05 (=B4 성공 setting 재현)",
+      "phase": "training",
+      "results": {},
+      "inf_jobs": {}
+    },
+    "b4_sw_w0075": {
+      "job_id": 30758,
+      "ckpt_dir": "/home1/sota/inha2026/checkpoints/b4sw_bw_w0075",
+      "ckpt_pattern": "ckpt_step*.pt",
+      "adapter_type": "b4",
+      "inf_steps": [
+        4000,
+        6000,
+        8000,
+        10000,
+        12000
+      ],
+      "description": "B4 sweep weight=0.075",
+      "phase": "training",
+      "results": {},
+      "inf_jobs": {}
+    },
+    "b4_original_1000": {
+      "job_id": 30759,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step1000.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+        "mean": 0.3867979595023725,
+        "median": 0.3490374982357025,
+        "predicted_lb": 0.243719183800949
+      }
+    },
+    "b4_original_1500": {
+      "job_id": 30760,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step1500.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+        "mean": 0.37584324965805366,
+        "median": 0.33896900713443756,
+        "predicted_lb": 0.23933729986322147
+      }
+    },
+    "b4_original_5500": {
+      "job_id": 30761,
+      "inf_only": true,
+      "adapter_type": "b4",
+      "csv": "/home1/sota/inha2026/submission_kit/fresh/submission_b4_step5500.csv",
+      "phase": "done",
+      "results": {},
+      "inf_jobs": {},
+      "result": {
+        "mean": 0.3785247468665518,
+        "median": 0.3403564989566803,
+        "predicted_lb": 0.24040989874662072
+      }
+    }
+  },
+  "best_challenger": {
+    "csv": "submission_b4_step6000.csv",
+    "action": 0.3798,
+    "lb": 0.2407
+  },
+  "success_candidates": [],
+  "codex_reviews": []
+}
+```
+
+## 물음 (roundtable)
+1. 이 pivot 시점에서 다음 후보 우선순위?
+2. 현재 결과 중 개선 신호 있는가 (Action + Visual 종합)?
+3. 실측 slot 사용할 만한 candidate?
+4. 다음 학습 launch 권장? 어떤 것?
+5. 마감 안전 관점에서 위험한 시도가 있는가?
+
+brutally honest. 이전 자문 (`codex_break_b4.txt`, `codex_plan_review.txt`, `codex_log_review.txt`)의 조언 재확인. 짧게 (300 words 이내).
+
+codex
+이전 자문 파일과 현재 루프/산출물을 직접 대조해, 실측 슬롯 기준으로 냉정하게 정리하겠습니다.
+exec
+/bin/bash -lc "pwd && rg --files | rg 'codex_(break_b4|plan_review|log_review)\\.txt"'$|auto.*loop|state.*json'"'" in /home1/sota/inha2026
+ succeeded in 0ms:
+exec
+/bin/bash -lc "sed -n '1,240p' docs/plans/fresh_restart/codex_break_b4.txt; sed -n '1,240p' docs/plans/fresh_restart/codex_plan_review.txt; sed -n '1,260p' docs/plans/fresh_restart/codex_log_review.txt" in /home1/sota/inha2026
+ succeeded in 0ms:
+Reading prompt from stdin...
+OpenAI Codex v0.147.0
+--------
+workdir: /home1/sota/inha2026
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: none
+reasoning summaries: none
+session id: 01a01526-89b6-7e11-84a4-a0b73292dbf2
+--------
+user
+CONTEXT: 2026 인하 AI 챌린지, Cosmos3-Nano LoRA fine-tune. Kit GRU 채점 규정 위반 (자체 predictor만 허용). 시간 무제한.
+
+## 실측 결과 (모두 v5b_ANCHORED_soft 40k base + 다양한 fine-tune)
+
+| CSV | Action mean | 실측 LB | 예상 LB | 특성 |
+|---|---|---|---|---|
+| v5b_ANCH (안전본) | 0.3886 | **0.24524** | - | 40k step |
+| **B4 step6k** | 0.3798 | **0.2407** | 0.2409 | ⭐ 도전본. E invdyn L1 w=(1-σ)·0.05, effective≈0.005 |
+| Z6 step2k | 0.3813 | - | 0.2415 | Bounded adapter α_max=0.08 + preserve loss |
+| NAP step8k | 0.3819 | - | 0.2418 | LoRA freeze, action_proj_in/out만 학습 |
+| Z5 step5k | 0.3970 | - | 0.2478 | Shuffled ranking + cross-attn adapter (no bounded) |
+| B4v2 step4k | 0.3735 | **0.2508** | 0.2384 | Weight 0.15 constant → visual 0.089→0.101 손상 |
+
+## Pattern (Codex Z6 자문 반영)
+- 70:30 objective misalign : magnitude explosion
+- E invdyn(우리 자체) vs kit GRU 부호 반전 (판독기 v2에서 확인)
+- Multi-loss balance 부재
+
+## 새 후보 (설계 검증 필요)
+
+### 후보 1: Z6-B4 hybrid
+```
+L = L_flow + 0.05·(1-σ)·L_action_E_invdyn + 0.10·L_preserve
++ Bounded cross-attn adapter α_max=0.05 (더 보수적)
++ RMS normalization + weight_decay 1e-4
++ 15k step (Blackwell 1s/step → 4h)
+```
+근거:
+- B4 안정 weight scheme (visual 유지 확인)
+- Z6 preserve loss (visual 손상 방지)
+- Bounded 구조로 무제한 성장 방지
+- 15k = 1.4 epoch로 안정 학습
+
+### 후보 2: B4 longer + weight schedule
+```
+B4 방식 유지, step 6k → 20k
+Weight schedule: 0-5k(0.02) → 5-15k(0.05) → 15k+(0.10)
+```
+
+### 후보 3: NAP + LoRA 병행
+```
+FREEZE_LORA=0, LoRA + action_proj 함께 학습
+NAP 방식은 유지 (action_proj 강조)
+20k step
+```
+
+## 물음 (brutally honest)
+1. Z6-B4 hybrid가 B4를 이길 확률? (Codex 30% 문턱)
+2. B4 6k에서 optimal이었나 아니면 학습 부족?
+3. 후보 3 (NAP+LoRA)이 v5b 원본 학습과 실질 차이 있나?
+4. 이 시점에서 근본적으로 다른 접근 (RAFT/DPO/RL, latent-space IDM 재학습, 새 backbone 등)이 실질 upside 있나?
+
+exec
+/bin/bash -lc 'for f in /home1/sota/inha2026/docs/plans/fresh_restart/{codex_pivot_tick40.txt,codex_pivot_tick8.txt,codex_z5.txt,codex_z6.txt,codex_v7.txt,RULES_v3_FINAL.md} /home1/sota/inha2026/baseline/IMPLEMENTATION_NOTES.md; do echo FILE:$f; rg -n -i "final|결론|권고|priority|우선|slot|규정|judge|mp4|post|inference|CFG|sampl|seed|visual|proxy|buffer|6.?10|새 학습|RAFT|ensemble|blend" "$f" | tail -n 80; done' in /home1/sota
+ succeeded in 0ms:
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick40.txt
+1030:docs/plans/fresh_restart/codex_pivot_tick8.txt:976:docs/plans/fresh_restart/codex_z5.txt:162:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+1031:docs/plans/fresh_restart/codex_pivot_tick8.txt:977:docs/plans/fresh_restart/codex_z5.txt:169:- `v_pred rel_l2`와 visual validation을 동시에
+1032:docs/plans/fresh_restart/codex_pivot_tick8.txt:978:docs/plans/fresh_restart/codex_z5.txt:238:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+1033:docs/plans/fresh_restart/codex_pivot_tick8.txt:979:docs/plans/fresh_restart/codex_z5.txt:273:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+1034:docs/plans/fresh_restart/codex_pivot_tick8.txt:980:docs/plans/fresh_restart/codex_z5.txt:275:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+1035:docs/plans/fresh_restart/codex_pivot_tick8.txt:981:docs/plans/fresh_restart/codex_z5.txt:293:- visual rel-L2 악화 없음
+1036:docs/plans/fresh_restart/codex_pivot_tick8.txt:982:docs/plans/fresh_restart/codex_z5.txt:564:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+1037:docs/plans/fresh_restart/codex_pivot_tick8.txt:983:docs/plans/fresh_restart/codex_z5.txt:602:- visual/text alignment 손상
+1038:docs/plans/fresh_restart/codex_pivot_tick8.txt:984:docs/plans/fresh_restart/codex_z5.txt:619:Action이 운동 방향과 타이밍을 바꾸려면 중간층이 더 자연스럽습니다. late-only adapter는 이미 형성된 trajectory를 끝에서 억지로 수정하면서 visual term을 손상할 가능성이 있습니다.
+1039:docs/plans/fresh_restart/codex_pivot_tick8.txt:985:docs/plans/fresh_restart/codex_z5.txt:655:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+1040:docs/plans/fresh_restart/codex_pivot_tick8.txt:986:docs/plans/fresh_restart/codex_z5.txt:662:- `v_pred rel_l2`와 visual validation을 동시에
+1041:docs/plans/fresh_restart/codex_pivot_tick8.txt:987:docs/plans/fresh_restart/codex_z5.txt:731:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+1042:docs/plans/fresh_restart/codex_pivot_tick8.txt:988:docs/plans/fresh_restart/codex_z5.txt:766:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+1043:docs/plans/fresh_restart/codex_pivot_tick8.txt:989:docs/plans/fresh_restart/codex_z5.txt:768:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+1044:docs/plans/fresh_restart/codex_pivot_tick8.txt:990:docs/plans/fresh_restart/codex_z5.txt:786:- visual rel-L2 악화 없음
+1045:docs/plans/fresh_restart/codex_pivot_tick8.txt:991:docs/plans/fresh_restart/codex_z5.txt:1057:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+1046:docs/plans/fresh_restart/codex_pivot_tick8.txt:992:docs/plans/fresh_restart/codex_paper.txt:102:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+1047:docs/plans/fresh_restart/codex_pivot_tick8.txt:993:docs/plans/fresh_restart/codex_paper.txt:317:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+1048:docs/plans/fresh_restart/codex_pivot_tick8.txt:1003:docs/plans/fresh_restart/codex_v8.txt:175:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+1049:docs/plans/fresh_restart/codex_pivot_tick8.txt:1004:docs/plans/fresh_restart/codex_v8.txt:400:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+1050:docs/plans/fresh_restart/codex_pivot_tick8.txt:1009:docs/plans/fresh_restart/codex_v7.txt:217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1051:docs/plans/fresh_restart/codex_pivot_tick8.txt:1010:docs/plans/fresh_restart/codex_v7.txt:311:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1052:docs/plans/fresh_restart/codex_pivot_tick8.txt:1011:docs/plans/fresh_restart/codex_v7.txt:450:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1053:docs/plans/fresh_restart/codex_pivot_tick8.txt:1012:docs/plans/fresh_restart/codex_v7.txt:544:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1054:docs/plans/fresh_restart/codex_pivot_tick8.txt:1014:logs/fresh/z5inf5k_30690.log:79:vs B4v2_step4k: 0.3735 (LB 0.2508 - visual 손상!)
+1055:docs/plans/fresh_restart/codex_pivot_tick8.txt:1015:logs/fresh/z5inf5k_30690.log:80:예상 LB (visual 유지 가정): 0.2478
+1057:docs/plans/fresh_restart/codex_pivot_tick8.txt:1020:logs/fresh/z6inf2k_30720.log:77:예상 LB (v5b visual 유지 가정): 0.2415
+1058:docs/plans/fresh_restart/codex_pivot_tick8.txt:1023:냉정한 결론: **신호는 있지만, 아직 실측 확정급은 아닙니다. Action proxy 단독 신뢰는 이미 B4v2/Z6-B4가 반증했습니다.**
+1059:docs/plans/fresh_restart/codex_pivot_tick8.txt:1029:`b4_original_1500`의 Action 0.3758은 B4 대비 -0.0040으로 명백한 탐색 신호입니다. 다만 예상 LB 0.23934는 과신 금지. `5500`은 B4와 매우 가까워 재현성 확인 신호 정도입니다. **별도 visual 측정값이 없으므로 “Action+Visual 개선”은 확정 불가**입니다.
+1061:docs/plans/fresh_restart/codex_pivot_tick8.txt:1032:슬롯이 넉넉하면 **1500 하나만** 가치 있습니다. 5500은 B4 6000과 너무 가까워 정보가치가 낮습니다. 슬롯이 1–2개뿐이면 sweep 결과를 기다리고, 1500보다 **visual-preserving Pareto 후보**에 사용하십시오. 현재 최종 제출 기본값은 여전히 B4 6000입니다.
+1062:docs/plans/fresh_restart/codex_pivot_tick8.txt:1040:이전 세 자문의 핵심—**B4 국소 탐색, proxy 불신, 단일 장기 checkpoint 회피, visual 보존 우선**—은 현재 결과로 더 강하게 지지됩니다.
+1063:docs/plans/fresh_restart/codex_pivot_tick8.txt:1043:냉정한 결론: **신호는 있지만, 아직 실측 확정급은 아닙니다. Action proxy 단독 신뢰는 이미 B4v2/Z6-B4가 반증했습니다.**
+1064:docs/plans/fresh_restart/codex_pivot_tick8.txt:1049:`b4_original_1500`의 Action 0.3758은 B4 대비 -0.0040으로 명백한 탐색 신호입니다. 다만 예상 LB 0.23934는 과신 금지. `5500`은 B4와 매우 가까워 재현성 확인 신호 정도입니다. **별도 visual 측정값이 없으므로 “Action+Visual 개선”은 확정 불가**입니다.
+1066:docs/plans/fresh_restart/codex_pivot_tick8.txt:1052:슬롯이 넉넉하면 **1500 하나만** 가치 있습니다. 5500은 B4 6000과 너무 가까워 정보가치가 낮습니다. 슬롯이 1–2개뿐이면 sweep 결과를 기다리고, 1500보다 **visual-preserving Pareto 후보**에 사용하십시오. 현재 최종 제출 기본값은 여전히 B4 6000입니다.
+1067:docs/plans/fresh_restart/codex_pivot_tick8.txt:1060:이전 세 자문의 핵심—**B4 국소 탐색, proxy 불신, 단일 장기 checkpoint 회피, visual 보존 우선**—은 현재 결과로 더 강하게 지지됩니다.
+1068:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:12:  - 실측 slot 사용 (dacon 제출)
+1070:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:40:2. **실측 LB signal 확보 (제출 slot 최소)**:
+1071:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:41:   - v5b_ANCH 실측 0.24524, seed1 0.270, TTO 0.04 (위반), e_select_ANCH 0.263
+1074:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:46:   - 새 학습 launch 전: 판독기 신뢰도 확인 (실측 vs 예측 오차 ±0.02 이내)
+1083:docs/plans/fresh_restart/AUTOMATION_RULES_v2.md:124:6. 판독기 판정 좋으면 사용자 실측 slot 요청
+1084:docs/plans/fresh_restart/codex_v6.txt:23:- 실측 최고 (규정 준수): v5b_ANCHORED_soft 0.24524 (Cosmos3-Nano LoRA 40k step, delta_base action, first-frame anchor 후처리)
+1086:docs/plans/fresh_restart/codex_paper.txt:102:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+1087:docs/plans/fresh_restart/codex_paper.txt:317:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+1088:docs/plans/fresh_restart/RULES_v3_FINAL.md:7:## 🔑 핵심 통찰 (0.04 실측이 알려준 것)
+1089:docs/plans/fresh_restart/RULES_v3_FINAL.md:9:**TTO 실측 0.04 breakdown**:
+1090:docs/plans/fresh_restart/RULES_v3_FINAL.md:50:   - 실측 slot 사용 (dacon 제출)
+1091:docs/plans/fresh_restart/RULES_v3_FINAL.md:52:4. **실측 slot 매우 신중** — Codex v5 지적 "각 CSV 스코어 보고 선택도 위반 소지". 남용 금지.
+1092:docs/plans/fresh_restart/RULES_v3_FINAL.md:61:- 위치: `submission_kit/fresh/input_videos_tto_v5b_ANCH_dino16/` (216 mp4, 실측 0.04)
+1093:docs/plans/fresh_restart/RULES_v3_FINAL.md:102:5. **실측 4점** (v5b_ANCH 0.245, seed1 0.270, e_select 0.263, ANCHORED_soft 0.245) 대비 로컬 예측 오차 계산
+1094:docs/plans/fresh_restart/RULES_v3_FINAL.md:120:6. 판독기 지표 v5b_ANCH 개선 예측 시 사용자 실측 slot 요청
+1095:docs/plans/fresh_restart/RULES_v3_FINAL.md:124:1. **안전본 (반드시 지정)**: `submission_ANCHORED_soft.csv` (실측 0.24524)
+1096:docs/plans/fresh_restart/RULES_v3_FINAL.md:130:## 📊 실측 자산 (다음 세션 시작 시점)
+1097:docs/plans/fresh_restart/RULES_v3_FINAL.md:132:| CSV | 실측 LB | 상태 |
+1098:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:26:## 실측 최고 (규정 준수 확인)
+1100:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:74:| 30629 fresh_infer | RUNNING | Fresh DiT 216 inference (첫 실측 signal 후보) |
+1102:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:97:- Action Component 통계 확인 → 실측 slot 사용 판단
+1104:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:119:- **도전본**: 실측 검증된 최선. E select (예상 0.235) or DynamiCrafter (예상 0.15~0.22)
+1105:docs/plans/fresh_restart/HANDOFF_2026-08-18.md:188:- 대기 중 인간 결정: 실측 slot 사용 (e_select_ANCH 검증? Fresh DiT 검증?)
+1107:docs/plans/fresh_restart/OFFICIAL_SCORING.md:32:이전 실패의 근본 원인: 6개 LB 표본으로 fit한 대리 회귀식 (`predict_lb.py`)에서 vid_l2 계수가 음수 등 인과 오해. 새 학습은 공식 3-component 실측 위주.
+1112:docs/plans/fresh_restart/codex_v7.txt:217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1113:docs/plans/fresh_restart/codex_v7.txt:311:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1114:docs/plans/fresh_restart/codex_v7.txt:450:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1115:docs/plans/fresh_restart/codex_v7.txt:544:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1116:docs/plans/fresh_restart/codex_v5.txt:43:**실측 최고 (규정 준수, 정당)**: `submission_ANCHORED_soft.csv` = **0.24524**
+1119:냉정한 결론: `w=0.025/12k`는 **실측할 가치가 생겼지만, 개선 확정 신호는 아닙니다.**
+1121:1. **우선순위**
+1122:   1. `b4_sw_w0025 step12k` visual 확인 → 실측
+1130:   그러나 **Visual 수치가 없으므로 종합 개선이라고 말할 수 없습니다.** B4v2와 Z6-B4가 이미 “좋은 Action + 나쁜 실측”을 입증했습니다. `predicted_lb=0.2349`도 신뢰구간이 아니라 희망값입니다.
+1134:   하나 쓴다면 `w0025 step12k`. 단, visual proxy가 B4 대비 실질 악화하지 않았을 때만. Visual 미측정이어도 슬롯이 충분하면 정보가치는 있습니다. 4k–10k는 실측 우선순위가 낮습니다.
+1138:   이미 예정된 `w=0.05`를 최우선. 반드시 4k/6k/8k를 즉시 inference하십시오. 이후에는 새 학습보다 `w0025`의 10k–12k 근방 seed/짧은 continuation이 낫습니다. `w=0.075`는 후순위이며 장기 endpoint 의존 금지.
+1142:   magweight, hybrid, adapter, increasing weight, 새 predictor/RL은 전부 위험합니다. 마지막 6–10시간은 제출·파일 검증용으로 비우십시오.
+1144:이전 조언인 **B4 국소 탐색, proxy 불신, visual 보존, 다중 checkpoint 선택**은 그대로 유효하며 이번 결과가 오히려 강화합니다.
+1147:냉정한 결론: `w=0.025/12k`는 **실측할 가치가 생겼지만, 개선 확정 신호는 아닙니다.**
+1149:1. **우선순위**
+1150:   1. `b4_sw_w0025 step12k` visual 확인 → 실측
+1158:   그러나 **Visual 수치가 없으므로 종합 개선이라고 말할 수 없습니다.** B4v2와 Z6-B4가 이미 “좋은 Action + 나쁜 실측”을 입증했습니다. `predicted_lb=0.2349`도 신뢰구간이 아니라 희망값입니다.
+1162:   하나 쓴다면 `w0025 step12k`. 단, visual proxy가 B4 대비 실질 악화하지 않았을 때만. Visual 미측정이어도 슬롯이 충분하면 정보가치는 있습니다. 4k–10k는 실측 우선순위가 낮습니다.
+1166:   이미 예정된 `w=0.05`를 최우선. 반드시 4k/6k/8k를 즉시 inference하십시오. 이후에는 새 학습보다 `w0025`의 10k–12k 근방 seed/짧은 continuation이 낫습니다. `w=0.075`는 후순위이며 장기 endpoint 의존 금지.
+1170:   magweight, hybrid, adapter, increasing weight, 새 predictor/RL은 전부 위험합니다. 마지막 6–10시간은 제출·파일 검증용으로 비우십시오.
+1172:이전 조언인 **B4 국소 탐색, proxy 불신, visual 보존, 다중 checkpoint 선택**은 그대로 유효하며 이번 결과가 오히려 강화합니다.
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/codex_pivot_tick8.txt
+940:docs/plans/fresh_restart/codex_break_b4.txt:42:- B4 안정 weight scheme (visual 유지 확인)
+941:docs/plans/fresh_restart/codex_break_b4.txt:43:- Z6 preserve loss (visual 손상 방지)
+942:docs/plans/fresh_restart/codex_break_b4.txt:223:- base와의 visual latent drift 및 여러 자체 IDM의 합의도로 Pareto selection
+943:docs/plans/fresh_restart/codex_break_b4.txt:380:- base와의 visual latent drift 및 여러 자체 IDM의 합의도로 Pareto selection
+944:scripts/track_z5/finetune_z6.py:14:  visual proxy 2회 연속 악화: rollback signal (early exit)
+945:docs/plans/fresh_restart/codex_z6.txt:19:- **B4v2 (weight fix: constant 0.15, 4k step)**: Action 0.3735 하지만 LB 0.2508 (**visual term 0.089→0.101 손상**, +0.0056 악화)
+946:docs/plans/fresh_restart/codex_z6.txt:30:2. Residual 무한 성장 — regularizer 없어 adapter가 base v5b visual 지식 훼손
+947:docs/plans/fresh_restart/codex_z6.txt:37:   - L = w1·L_flow + w2·L_action + w3·L_visual
+948:docs/plans/fresh_restart/codex_z6.txt:38:   - L_visual: 우리 자체 학습 R3D-equivalent (train video only) 사용
+949:docs/plans/fresh_restart/codex_z6.txt:58:3. **Action-video tradeoff 상한** (Action 낮추면 visual 반드시 손상되는 것)을 근본적으로 해결하는 방법이 있나? 
+950:docs/plans/fresh_restart/codex_z6.txt:94:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+951:docs/plans/fresh_restart/codex_z6.txt:104:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+952:docs/plans/fresh_restart/codex_z6.txt:105:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+953:docs/plans/fresh_restart/codex_z6.txt:116:- `Δ visual preservation`
+954:docs/plans/fresh_restart/codex_z6.txt:166:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+955:docs/plans/fresh_restart/codex_z6.txt:185:\cos(g_{\rm action}, g_{\rm visual}),\quad
+956:docs/plans/fresh_restart/codex_z6.txt:212:즉, visual과 action이 같은 전체 feature를 놓고 싸우지 않게 분리해야 합니다.
+957:docs/plans/fresh_restart/codex_z6.txt:214:partial unfreezing은 지금 추천하지 않습니다. 46시간, 작은 데이터, visual 손상 관측이라는 조건에서는 frozen-base adapter보다 위험합니다. 특히 130M adapter + base 일부까지 풀면 stable 40k run 확률이 더 낮아집니다.
+958:docs/plans/fresh_restart/codex_z6.txt:306:- base visual feature를 덜 직접적으로 교란
+959:docs/plans/fresh_restart/codex_z6.txt:365:- visual proxy degradation 1% 이내
+960:docs/plans/fresh_restart/codex_z6.txt:366:- action/visual gradient cosine이 심하게 음수가 아님
+961:docs/plans/fresh_restart/codex_z6.txt:411:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+962:docs/plans/fresh_restart/codex_z6.txt:421:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+963:docs/plans/fresh_restart/codex_z6.txt:422:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+964:docs/plans/fresh_restart/codex_z6.txt:433:- `Δ visual preservation`
+965:docs/plans/fresh_restart/codex_z6.txt:483:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+966:docs/plans/fresh_restart/codex_z6.txt:502:\cos(g_{\rm action}, g_{\rm visual}),\quad
+967:docs/plans/fresh_restart/codex_z6.txt:529:즉, visual과 action이 같은 전체 feature를 놓고 싸우지 않게 분리해야 합니다.
+968:docs/plans/fresh_restart/codex_z6.txt:531:partial unfreezing은 지금 추천하지 않습니다. 46시간, 작은 데이터, visual 손상 관측이라는 조건에서는 frozen-base adapter보다 위험합니다. 특히 130M adapter + base 일부까지 풀면 stable 40k run 확률이 더 낮아집니다.
+969:docs/plans/fresh_restart/codex_z6.txt:623:- base visual feature를 덜 직접적으로 교란
+970:docs/plans/fresh_restart/codex_z6.txt:682:- visual proxy degradation 1% 이내
+971:docs/plans/fresh_restart/codex_z6.txt:683:- action/visual gradient cosine이 심하게 음수가 아님
+972:docs/plans/fresh_restart/codex_z5.txt:19:- **B4v2** (weight 3x 증가, constant weight): Action **0.3735** → **LB 0.2508 (악화)**. Visual term 0.089 → 0.101 손상. 즉 pixel-space E invdyn loss는 output만 눌러 visual 손상 유발.
+973:docs/plans/fresh_restart/codex_z5.txt:55:6. E invdyn (기존 clean-room predictor)를 어떻게 활용? Pixel decode → E invdyn (기존 B4 방식, visual 손상) vs 다른 방식?
+974:docs/plans/fresh_restart/codex_z5.txt:109:- visual/text alignment 손상
+975:docs/plans/fresh_restart/codex_z5.txt:126:Action이 운동 방향과 타이밍을 바꾸려면 중간층이 더 자연스럽습니다. late-only adapter는 이미 형성된 trajectory를 끝에서 억지로 수정하면서 visual term을 손상할 가능성이 있습니다.
+976:docs/plans/fresh_restart/codex_z5.txt:162:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+977:docs/plans/fresh_restart/codex_z5.txt:169:- `v_pred rel_l2`와 visual validation을 동시에
+978:docs/plans/fresh_restart/codex_z5.txt:238:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+979:docs/plans/fresh_restart/codex_z5.txt:273:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+980:docs/plans/fresh_restart/codex_z5.txt:275:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+981:docs/plans/fresh_restart/codex_z5.txt:293:- visual rel-L2 악화 없음
+982:docs/plans/fresh_restart/codex_z5.txt:564:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+983:docs/plans/fresh_restart/codex_z5.txt:602:- visual/text alignment 손상
+984:docs/plans/fresh_restart/codex_z5.txt:619:Action이 운동 방향과 타이밍을 바꾸려면 중간층이 더 자연스럽습니다. late-only adapter는 이미 형성된 trajectory를 끝에서 억지로 수정하면서 visual term을 손상할 가능성이 있습니다.
+985:docs/plans/fresh_restart/codex_z5.txt:655:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+986:docs/plans/fresh_restart/codex_z5.txt:662:- `v_pred rel_l2`와 visual validation을 동시에
+987:docs/plans/fresh_restart/codex_z5.txt:731:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+988:docs/plans/fresh_restart/codex_z5.txt:766:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+989:docs/plans/fresh_restart/codex_z5.txt:768:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+990:docs/plans/fresh_restart/codex_z5.txt:786:- visual rel-L2 악화 없음
+991:docs/plans/fresh_restart/codex_z5.txt:1057:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+992:docs/plans/fresh_restart/codex_paper.txt:102:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+993:docs/plans/fresh_restart/codex_paper.txt:317:- 약 500시간의 다양한 AgiBot 데이터에서 학습했으며, 비디오-only 인간/타 로봇 데모 10–20분으로 unseen-task 성능이 상대적으로 42% 이상 개선됐다고 보고합니다. 저자들은 주요 실패가 action decoder보다는 **잘못 생성된 visual future**에서 발생한다고 분석합니다. [논문 본문](https://arxiv.org/abs/2602.15922)
+1003:docs/plans/fresh_restart/codex_v8.txt:175:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+1004:docs/plans/fresh_restart/codex_v8.txt:400:- pixel L1/LPIPS 또는 자체 visual proxy가 급격히 악화되지 않음
+1009:docs/plans/fresh_restart/codex_v7.txt:217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1010:docs/plans/fresh_restart/codex_v7.txt:311:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1011:docs/plans/fresh_restart/codex_v7.txt:450:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+1012:docs/plans/fresh_restart/codex_v7.txt:544:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+1013:docs/plans/fresh_restart/tto_v5b_seed0_report.json:1938:      "pix_max": 0.3785395920276642,
+1014:logs/fresh/z5inf5k_30690.log:79:vs B4v2_step4k: 0.3735 (LB 0.2508 - visual 손상!)
+1015:logs/fresh/z5inf5k_30690.log:80:예상 LB (visual 유지 가정): 0.2478
+1020:logs/fresh/z6inf2k_30720.log:77:예상 LB (v5b visual 유지 가정): 0.2415
+1023:냉정한 결론: **신호는 있지만, 아직 실측 확정급은 아닙니다. Action proxy 단독 신뢰는 이미 B4v2/Z6-B4가 반증했습니다.**
+1025:1. 후보 우선순위  
+1026:`w=0.05` sweep의 **4k/6k/8k** → `w=0.025`의 4k/6k/8k → `w=0.075` 초기 checkpoint → 나머지. **12k endpoint보다 checkpoint selection 우선**입니다.
+1029:`b4_original_1500`의 Action 0.3758은 B4 대비 -0.0040으로 명백한 탐색 신호입니다. 다만 예상 LB 0.23934는 과신 금지. `5500`은 B4와 매우 가까워 재현성 확인 신호 정도입니다. **별도 visual 측정값이 없으므로 “Action+Visual 개선”은 확정 불가**입니다.
+1032:슬롯이 넉넉하면 **1500 하나만** 가치 있습니다. 5500은 B4 6000과 너무 가까워 정보가치가 낮습니다. 슬롯이 1–2개뿐이면 sweep 결과를 기다리고, 1500보다 **visual-preserving Pareto 후보**에 사용하십시오. 현재 최종 제출 기본값은 여전히 B4 6000입니다.
+1035:**새 구조 launch 금지.** 실행 순서를 바꿀 수 있다면 `w=0.05`를 최우선으로 당기고 checkpoint별 inference를 확보하십시오. 추가 launch가 꼭 필요하면 정확한 B4 `w=0.05, seed/설정 재현, 6–8k` 한 번뿐입니다.
+1038:Magweight 전체-loss 적용, hybrid/v2, NAP+LoRA, E-invdyn/RL, 12–20k 단일 endpoint는 중단/후순위. 마지막 **8–10시간은 제출·CSV·재현 검증 buffer**로 고정하십시오.
+1040:이전 세 자문의 핵심—**B4 국소 탐색, proxy 불신, 단일 장기 checkpoint 회피, visual 보존 우선**—은 현재 결과로 더 강하게 지지됩니다.
+1043:냉정한 결론: **신호는 있지만, 아직 실측 확정급은 아닙니다. Action proxy 단독 신뢰는 이미 B4v2/Z6-B4가 반증했습니다.**
+1045:1. 후보 우선순위  
+1046:`w=0.05` sweep의 **4k/6k/8k** → `w=0.025`의 4k/6k/8k → `w=0.075` 초기 checkpoint → 나머지. **12k endpoint보다 checkpoint selection 우선**입니다.
+1049:`b4_original_1500`의 Action 0.3758은 B4 대비 -0.0040으로 명백한 탐색 신호입니다. 다만 예상 LB 0.23934는 과신 금지. `5500`은 B4와 매우 가까워 재현성 확인 신호 정도입니다. **별도 visual 측정값이 없으므로 “Action+Visual 개선”은 확정 불가**입니다.
+1052:슬롯이 넉넉하면 **1500 하나만** 가치 있습니다. 5500은 B4 6000과 너무 가까워 정보가치가 낮습니다. 슬롯이 1–2개뿐이면 sweep 결과를 기다리고, 1500보다 **visual-preserving Pareto 후보**에 사용하십시오. 현재 최종 제출 기본값은 여전히 B4 6000입니다.
+1055:**새 구조 launch 금지.** 실행 순서를 바꿀 수 있다면 `w=0.05`를 최우선으로 당기고 checkpoint별 inference를 확보하십시오. 추가 launch가 꼭 필요하면 정확한 B4 `w=0.05, seed/설정 재현, 6–8k` 한 번뿐입니다.
+1058:Magweight 전체-loss 적용, hybrid/v2, NAP+LoRA, E-invdyn/RL, 12–20k 단일 endpoint는 중단/후순위. 마지막 **8–10시간은 제출·CSV·재현 검증 buffer**로 고정하십시오.
+1060:이전 세 자문의 핵심—**B4 국소 탐색, proxy 불신, 단일 장기 checkpoint 회피, visual 보존 우선**—은 현재 결과로 더 강하게 지지됩니다.
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/codex_z5.txt
+19:- **B4v2** (weight 3x 증가, constant weight): Action **0.3735** → **LB 0.2508 (악화)**. Visual term 0.089 → 0.101 손상. 즉 pixel-space E invdyn loss는 output만 눌러 visual 손상 유발.
+25:- gen path: input_layernorm_moe_gen → self_attn → post_attention_layernorm_moe_gen → mlp_moe_gen
+55:6. E invdyn (기존 clean-room predictor)를 어떻게 활용? Pixel decode → E invdyn (기존 B4 방식, visual 손상) vs 다른 방식?
+58:9. D-2 시점 (남은 53h) 이 접근 vs 다른 방법 (예: latent-space E invdyn 재학습 후 fine-tune) 우선순위?
+66:로컬 샌드박스가 네트워크 네임스페이스 초기화 단계에서 막혀 저장소 검색이 실행되지 않았습니다. 우선 공식 diffusers 소스에서 클래스 구조와 hook 지점을 검증하고, skeleton은 버전 차이를 감지해 실패하도록 작성하겠습니다.
+76:결론부터 말하면, Z5는 그대로 15k 돌리기엔 위험합니다. 가장 큰 이유는 Cosmos3가 이미 generation query가 action token을 포함한 전체 gen KV에 접근하는 구조라서, 별도 cross-attention이 새 정보 경로를 만드는 것이 아니라 기존 경로를 중복하기 때문입니다. 공식 v0.39.0 구현에서도 action은 `action_proj_in`을 거쳐 gen sequence에 삽입되고, gen attention은 understanding+generation 전체 KV를 봅니다. [diffusers v0.39.0 source](https://raw.githubusercontent.com/huggingface/diffusers/v0.39.0/src/diffusers/models/transformers/transformer_cosmos3.py)
+108:- CFG unconditional branch 변화
+109:- visual/text alignment 손상
+126:Action이 운동 방향과 타이밍을 바꾸려면 중간층이 더 자연스럽습니다. late-only adapter는 이미 형성된 trajectory를 끝에서 억지로 수정하면서 visual term을 손상할 가능성이 있습니다.
+162:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+169:- `v_pred rel_l2`와 visual validation을 동시에
+194:- timestep이 너무 noisy한 sample은 제외하거나 SNR weighting
+226:- 15%는 CFG를 실제로 action-unconditional branch에 사용할 때만
+238:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+273:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+275:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+285:- 1h: fixed-seed GT/shuffle/reverse/zero evaluation
+293:- visual rel-L2 악화 없음
+294:- fixed-seed motion direction 변화
+298:### 9. D-2 우선순위
+308:latent E가 2–4시간 안에 충분한 validation accuracy를 낼 기존 데이터/코드가 있다면 우선순위가 2번까지 올라갑니다. 새로 dataset plumbing부터 해야 한다면 D-2에는 늦습니다.
+336:아래 skeleton은 v0.39.0의 layer signature에 맞습니다. 실제 Cosmos forward는 batch dimension 없는 packed `[N,H]`를 사용하므로, `vision_local_idx`와 action context가 동일 sample에 속하는지 반드시 보장해야 합니다. 여러 sample을 하나의 sequence로 이어 붙인다면 sample별 block mask가 추가로 필요합니다.
+564:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+569:결론부터 말하면, Z5는 그대로 15k 돌리기엔 위험합니다. 가장 큰 이유는 Cosmos3가 이미 generation query가 action token을 포함한 전체 gen KV에 접근하는 구조라서, 별도 cross-attention이 새 정보 경로를 만드는 것이 아니라 기존 경로를 중복하기 때문입니다. 공식 v0.39.0 구현에서도 action은 `action_proj_in`을 거쳐 gen sequence에 삽입되고, gen attention은 understanding+generation 전체 KV를 봅니다. [diffusers v0.39.0 source](https://raw.githubusercontent.com/huggingface/diffusers/v0.39.0/src/diffusers/models/transformers/transformer_cosmos3.py)
+601:- CFG unconditional branch 변화
+602:- visual/text alignment 손상
+619:Action이 운동 방향과 타이밍을 바꾸려면 중간층이 더 자연스럽습니다. late-only adapter는 이미 형성된 trajectory를 끝에서 억지로 수정하면서 visual term을 손상할 가능성이 있습니다.
+655:   adapter 출력이 커지면서 pretrained visual representation을 덮습니다. B4v2와 다른 경로지만 visual degradation 양상은 재현될 수 있습니다.
+662:- `v_pred rel_l2`와 visual validation을 동시에
+687:- timestep이 너무 noisy한 sample은 제외하거나 SNR weighting
+719:- 15%는 CFG를 실제로 action-unconditional branch에 사용할 때만
+731:Pixel decode → frozen E → generator backprop은 다시 쓰지 않는 것이 좋습니다. B4v2 결과가 이미 이 경로의 reward hacking/visual damage를 보여줍니다.
+766:- B4v2처럼 visual 손상으로 악화: 새 adapter 전체 학습 시 40% 이상
+768:현재 안전본이 LB 0.2408이라면 목표는 “Action metric만 낮추기”가 아니라 visual term을 거의 고정하면서 Action을 낮추는 것입니다. realistic upside는 `+0.002~0.006 LB` 정도로 보는 편이 맞습니다. `0.250+` 재현을 기대하기는 어렵습니다.
+778:- 1h: fixed-seed GT/shuffle/reverse/zero evaluation
+786:- visual rel-L2 악화 없음
+787:- fixed-seed motion direction 변화
+791:### 9. D-2 우선순위
+801:latent E가 2–4시간 안에 충분한 validation accuracy를 낼 기존 데이터/코드가 있다면 우선순위가 2번까지 올라갑니다. 새로 dataset plumbing부터 해야 한다면 D-2에는 늦습니다.
+829:아래 skeleton은 v0.39.0의 layer signature에 맞습니다. 실제 Cosmos forward는 batch dimension 없는 packed `[N,H]`를 사용하므로, `vision_local_idx`와 action context가 동일 sample에 속하는지 반드시 보장해야 합니다. 여러 sample을 하나의 sequence로 이어 붙인다면 sample별 block mask가 추가로 필요합니다.
+1057:λ를 3배 고정하는 방식은 B4v2와 같은 overshoot를 만들 수 있습니다. 500–1,000 step warm-up 후 올리고, visual validation이 악화되면 즉시 줄이세요.
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/codex_z6.txt
+14:CONTEXT: 2026 인하 AI 챌린지 D-day 46h 남음. SO-100 로봇팔 first frame + 16 actions → 16 frames video 생성. 채점 = 0.3·(1-DINO_cos) + 0.3·(1-Video_cos R3D-18) + 0.4·Action_MAE. **kit checkpoint (action_extractor GRU, R3D-18, DINOv2) 학습·selection 규정 위반**. 외부 pretrained (Cosmos3 등) + 자체 clean-room predictor 허용.
+19:- **B4v2 (weight fix: constant 0.15, 4k step)**: Action 0.3735 하지만 LB 0.2508 (**visual term 0.089→0.101 손상**, +0.0056 악화)
+20:- **Z5 (Cross-attn adapter 82M, layers 20-35, shuffled action ranking, 5k step)**: Action **0.3970** (v5b보다 +0.0084 나쁨). Per-sample 반반 (Z5 wins 101/216, B4 wins 115/216, max diff 0.6).
+30:2. Residual 무한 성장 — regularizer 없어 adapter가 base v5b visual 지식 훼손
+37:   - L = w1·L_flow + w2·L_action + w3·L_visual
+38:   - L_visual: 우리 자체 학습 R3D-equivalent (train video only) 사용
+58:3. **Action-video tradeoff 상한** (Action 낮추면 visual 반드시 손상되는 것)을 근본적으로 해결하는 방법이 있나? 
+69:8. D-day 46h 안에서 Z6 20h + inference 2h = 22h vs B4 확정 유지 (0h) 중 어느 것이 realistic?
+86:## 결론
+94:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+103:- `L_shuf/L_fm = 2–4×`이고 sample별 승패가 `101:115`로 거의 반반이라는 것은 adapter가 action을 무시한 게 아니라, **학습 proxy가 선호하는 motion cue를 실제 CSV GRU가 일관되게 선호하지 않았다는 뜻**에 가깝습니다.
+104:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+105:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+111:이를 가장 싸게 확인하는 방법은 validation set에서 다음 세 값을 sample-wise로 보는 것입니다.
+115:- `Δ 실제 action reconstruction` — 규정상 허용되는 자체 clean-room evaluator만 사용
+116:- `Δ visual preservation`
+166:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+185:\cos(g_{\rm action}, g_{\rm visual}),\quad
+212:즉, visual과 action이 같은 전체 feature를 놓고 싸우지 않게 분리해야 합니다.
+214:partial unfreezing은 지금 추천하지 않습니다. 46시간, 작은 데이터, visual 손상 관측이라는 조건에서는 frozen-base adapter보다 위험합니다. 특히 130M adapter + base 일부까지 풀면 stable 40k run 확률이 더 낮아집니다.
+225:- EVA는 학습된 inverse dynamics model을 reward로 사용해 생성 비디오의 실행 가능성을 강화합니다. 이쪽이 Z6의 문제와 훨씬 가깝지만, smoothness/embodiment constraints까지 포함한 RL post-training입니다. [EVA](https://arxiv.org/abs/2603.17808)
+229:- 다른 sample의 action이 현재 영상에도 물리적으로 가능한 false negative일 수 있음
+258:이번 대회에서 mask 변경의 기대효과는 낮거나 중간 정도입니다. **objective 정렬과 residual control보다 우선순위가 낮습니다.**
+278:입니다. 가능하면 robot-arm crop 또는 motion feature를 넣으십시오. 첫 frame/pose가 비슷한 sample을 기준으로 held-out action MAE와 rank correlation을 반드시 확인해야 합니다.
+280:중요하게, 규정상 kit GRU를 학습이나 selection에 쓸 수 없다면 **그 결과를 checkpoint 선택, loss tuning, threshold 설정에 사용하면 안 됩니다.** clean-room split과 evaluator를 고정한 뒤 개발해야 합니다.
+306:- base visual feature를 덜 직접적으로 교란
+318:- proxy loss
+324:26개 layer, 130M로 확장하는 것은 오히려 지금 증거와 반대 방향입니다. 먼저 82M을 통제하지 못했는데 용량을 늘리면 proxy exploitation 능력만 커질 수 있습니다.
+365:- visual proxy degradation 1% 이내
+366:- action/visual gradient cosine이 심하게 음수가 아님
+369:- 서로 다른 seed 또는 최소한 fixed mini-validation에서 개선이 특정 sample 몇 개에만 의존하지 않음
+378:- continuation: 6–10h
+379:- inference 및 submission validation: 3–4h
+380:- 장애 buffer: 최소 8–10h
+382:46시간 중 마지막 10–12시간은 건드리지 않는 편이 좋습니다. inference나 포맷 문제는 모델 연구보다 훨씬 허무하게 제출을 망칩니다.
+386:우선순위순입니다.
+403:## 결론
+411:- 최종 제출 안전본은 현재로서는 **B4, LB 0.2407**이어야 합니다. 질문에 적힌 “안전본 0.24524”보다 B4가 이미 우월하고 visual 붕괴도 보고되지 않았으므로, 별도 안정성 문제가 없다면 B4가 기본값입니다.
+420:- `L_shuf/L_fm = 2–4×`이고 sample별 승패가 `101:115`로 거의 반반이라는 것은 adapter가 action을 무시한 게 아니라, **학습 proxy가 선호하는 motion cue를 실제 CSV GRU가 일관되게 선호하지 않았다는 뜻**에 가깝습니다.
+421:- B4v2도 action proxy/CSV Action은 좋아졌지만 visual이 크게 망가졌습니다. 이는 “action signal 강화 → 정답 방향”이 아니라 **proxy를 만족하는 artifact 또는 evaluator-specific cue를 생성할 수 있음**을 보여줍니다.
+422:- residual이 3%→10%→13.8%로 단조 증가한 것은 별도의 심각한 문제입니다. 장기 학습 시 visual degradation을 가속했을 가능성은 높지만, **Z5의 action 역행 자체를 설명하는 핵심 증거는 아닙니다.**
+428:이를 가장 싸게 확인하는 방법은 validation set에서 다음 세 값을 sample-wise로 보는 것입니다.
+432:- `Δ 실제 action reconstruction` — 규정상 허용되는 자체 clean-room evaluator만 사용
+433:- `Δ visual preservation`
+483:- visual validation이 두 번 연속 악화: 이전 checkpoint rollback
+502:\cos(g_{\rm action}, g_{\rm visual}),\quad
+529:즉, visual과 action이 같은 전체 feature를 놓고 싸우지 않게 분리해야 합니다.
+531:partial unfreezing은 지금 추천하지 않습니다. 46시간, 작은 데이터, visual 손상 관측이라는 조건에서는 frozen-base adapter보다 위험합니다. 특히 130M adapter + base 일부까지 풀면 stable 40k run 확률이 더 낮아집니다.
+542:- EVA는 학습된 inverse dynamics model을 reward로 사용해 생성 비디오의 실행 가능성을 강화합니다. 이쪽이 Z6의 문제와 훨씬 가깝지만, smoothness/embodiment constraints까지 포함한 RL post-training입니다. [EVA](https://arxiv.org/abs/2603.17808)
+546:- 다른 sample의 action이 현재 영상에도 물리적으로 가능한 false negative일 수 있음
+575:이번 대회에서 mask 변경의 기대효과는 낮거나 중간 정도입니다. **objective 정렬과 residual control보다 우선순위가 낮습니다.**
+595:입니다. 가능하면 robot-arm crop 또는 motion feature를 넣으십시오. 첫 frame/pose가 비슷한 sample을 기준으로 held-out action MAE와 rank correlation을 반드시 확인해야 합니다.
+597:중요하게, 규정상 kit GRU를 학습이나 selection에 쓸 수 없다면 **그 결과를 checkpoint 선택, loss tuning, threshold 설정에 사용하면 안 됩니다.** clean-room split과 evaluator를 고정한 뒤 개발해야 합니다.
+623:- base visual feature를 덜 직접적으로 교란
+635:- proxy loss
+641:26개 layer, 130M로 확장하는 것은 오히려 지금 증거와 반대 방향입니다. 먼저 82M을 통제하지 못했는데 용량을 늘리면 proxy exploitation 능력만 커질 수 있습니다.
+682:- visual proxy degradation 1% 이내
+683:- action/visual gradient cosine이 심하게 음수가 아님
+686:- 서로 다른 seed 또는 최소한 fixed mini-validation에서 개선이 특정 sample 몇 개에만 의존하지 않음
+695:- continuation: 6–10h
+696:- inference 및 submission validation: 3–4h
+697:- 장애 buffer: 최소 8–10h
+699:46시간 중 마지막 10–12시간은 건드리지 않는 편이 좋습니다. inference나 포맷 문제는 모델 연구보다 훨씬 허무하게 제출을 망칩니다.
+703:우선순위순입니다.
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/codex_v7.txt
+21:- TTO(규정 위반) LB 0.04: Action 0.031(78%), R3D+DINO 0.009(22%). 각 cos ~0.985
+25:## 규정 (엄격, 위반 시 실격)
+28:- 이 모델들로 뽑은 정보 학습/inference/mp4 선택·수정 금지
+29:- **허용**: 외부 pretrained (Cosmos3, Wan, CogVideoX, DynamiCrafter 등), 우리 자체 clean-room predictor
+39:- **TTO 0.04**: kit GRU를 pixel residual optimize (규정 위반, 실격 대상)
+43:- v6: **DynamiCrafter-512** top-1 (30-45% 개선). HunyuanVideo/Open-Sora 제외. CogVideoX 2위, SVD 3위.
+46:- 내가 조사한 DynamiCrafter(2024 초), CogVideoX(2024), SVD(2023), HunyuanVideo(2024)는 **2026 기준 구식**
+53:**2026년 8월 시점 기준, 규정 준수 하 D-2 안에 fine-tune 가능한 오픈소스 image-to-video pretrained model 중 Cosmos3-Nano보다 확실히 좋은 후보 top-3**:
+57:2. **규격 호환**: 320×512 (또는 유사), 16 frame(또는 재sample 가능), image-to-video
+60:5. **최근 논문/이슈에서 로봇 arm/action-conditioned로 성공 사례 확인된 모델** 우선
+70:**아직 유효한 이전 옵션(예: DynamiCrafter-512 = baseline backbone과 동일)이 여전히 top이면 그것도 그대로 유지 근거를 명시**. 하지만 **2025 하반기 이후 명확히 나은 오픈소스가 있다면 그것이 우선**.
+92:## 결론
+102:단, 3위는 공개 상태에 함정이 있어 실전 추천도는 낮습니다. 지금 하나만 새로 돌린다면 **1위만 권합니다.** DynamiCrafter-512는 이제 top 후보가 아닙니다.
+120:- T2V+I2V, 공식 720p 지원, 단일 24GB GPU inference 가능. 80GB 이상에서는 offload 없이 실행하도록 공식 문서가 안내합니다. [Wan 공식 모델 카드](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+129:- 학습 비디오는 6fps로 직접 sample
+169:- inference/seed sweep: **4–10h**
+193:2026년 3월 이후 체크포인트를 쓸 수 있다면 HF 저장소의 최신 호환 revision/LTX-2.x를 확인하되, **학습 직전에 inference와 trainer revision을 고정**해야 합니다.
+199:- 실제 전체 repository는 base/distilled/upsampler/audio 구성에 따라 훨씬 커질 수 있으므로 전체 snapshot을 받지 말고 필요한 파일만 받아야 함
+217:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+224:- 디버깅과 inference: **6–12h**
+271:- inference code: 공개
+293:- BWM inference code를 학습 코드로 복원: **예측 불가**, 순조로워도 12–30h
+310:- **DynamiCrafter-512**: 여전히 안정적인 저비용 baseline이지만 2023–24 backbone이고, 이미 사용한 baseline 계열과 시각 prior 차이가 작음. 2026년 기준 top-3 유지 근거가 없음.
+311:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+325:## 결론
+335:단, 3위는 공개 상태에 함정이 있어 실전 추천도는 낮습니다. 지금 하나만 새로 돌린다면 **1위만 권합니다.** DynamiCrafter-512는 이제 top 후보가 아닙니다.
+353:- T2V+I2V, 공식 720p 지원, 단일 24GB GPU inference 가능. 80GB 이상에서는 offload 없이 실행하도록 공식 문서가 안내합니다. [Wan 공식 모델 카드](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+362:- 학습 비디오는 6fps로 직접 sample
+402:- inference/seed sweep: **4–10h**
+426:2026년 3월 이후 체크포인트를 쓸 수 있다면 HF 저장소의 최신 호환 revision/LTX-2.x를 확인하되, **학습 직전에 inference와 trainer revision을 고정**해야 합니다.
+432:- 실제 전체 repository는 base/distilled/upsampler/audio 구성에 따라 훨씬 커질 수 있으므로 전체 snapshot을 받지 말고 필요한 파일만 받아야 함
+450:그러나 **공개된 로봇 arm action-conditioned 성공 사례가 제가 확인한 범위에는 없습니다.** 즉, visual ceiling은 높지만 6-DoF action grounding은 처음부터 배워야 합니다.
+457:- 디버깅과 inference: **6–12h**
+504:- inference code: 공개
+526:- BWM inference code를 학습 코드로 복원: **예측 불가**, 순조로워도 12–30h
+543:- **DynamiCrafter-512**: 여전히 안정적인 저비용 baseline이지만 2023–24 backbone이고, 이미 사용한 baseline 계열과 시각 prior 차이가 작음. 2026년 기준 top-3 유지 근거가 없음.
+544:- **Ctrl-World**: 실제 ICLR 2026 action-conditioned robot model이지만 backbone이 SVD라서 최신 visual ceiling 요구와 충돌.
+FILE:/home1/sota/inha2026/docs/plans/fresh_restart/RULES_v3_FINAL.md
+3:이 문서 = 다음 세션 필독 · 유일한 진행 지침. 이전 문서(v1, v2)보다 우선.
+17:  - Action만 좋고 video 훼손 → adversarial artifact (TTO 방향, 규정 위반)
+22:- Loss: L_diffusion (video quality) + L_action_consistency (우리 자체 predictor recovery, 규정 준수)
+28:1. **규정 준수 최우선** — submission_kit 자원 (GRU/R3D/DINO) 학습·추론·selection 절대 금지. 위반 시 실격.
+31:4. **이미 실패한 접근 반복 금지** — Track E (skeleton), C (warp), TTO (kit GRU), Wan2.1-Fun, baseline UNet 11M, Fresh DiT scratch, SVD/DynamiCrafter 구식, HunyuanVideo, CogVideoX2/Cosmos3/Open-Sora Plan 2 (Codex v7 미검증) 등.
+40:3. **자동 후속 chain** — 학습 → inference → CSV 자동 (watcher).
+49:   - 규정 애매/위반 가능성 있는 결정
+50:   - 실측 slot 사용 (dacon 제출)
+52:4. **실측 slot 매우 신중** — Codex v5 지적 "각 CSV 스코어 보고 선택도 위반 소지". 남용 금지.
+54:6. **판독기 정확성 최우선** ⭐ (v2 지시) — 로컬 metric이 실제 리더보드 성능 악화를 정확히 감지해야. 판독기 예측 오차 ±0.02 이내 확인 후에만 학습 launch. 판독기 부정확이면 학습 결과 무의미.
+60:**허용**: 판단에 도움 필요할 때 TTO 생성 mp4를 **시각 관찰 목적**으로 확인 가능.
+61:- 위치: `submission_kit/fresh/input_videos_tto_v5b_ANCH_dino16/` (216 mp4, 실측 0.04)
+62:- 위치: `submission_kit/fresh/input_videos_tto_v5b_seed0*/` (기타 TTO variants)
+66:- TTO mp4나 그로부터 뽑은 어떤 정보 (feature, statistic, 특정 pattern)를 학습 loss에 사용
+67:- TTO mp4 자체를 새 모델 학습 data augmentation에 포함
+68:- TTO mp4를 selection reference로 사용
+69:- TTO mp4의 pixel/feature 통계를 후처리 파라미터 결정에 사용
+72:**요약**: 눈으로만 참고, 얻은 통찰을 **일반적 아키텍처 원칙**으로 승화해서만 사용. Pattern-copy는 규정 위반.
+78:| kit GRU/R3D/DINO를 loss/selection에 사용 | 규정 위반, 실격 |
+79:| kit backbone 별도 다운로드해서 surrogate로 사용 | 규정 위반 (Codex v5 명시) |
+80:| kit CSV 스코어 보고 seed 선택 | 규정 위반 소지 |
+85:| SVD, DynamiCrafter (2023-2024) | 2026 기준 구식 |
+102:5. **실측 4점** (v5b_ANCH 0.245, seed1 0.270, e_select 0.263, ANCHORED_soft 0.245) 대비 로컬 예측 오차 계산
+119:5. Inference 216 → 자체 판독기로 평가
+120:6. 판독기 지표 v5b_ANCH 개선 예측 시 사용자 실측 slot 요청
+136:| submission_t1_seed1.csv | 0.270 | 참고 |
+146:- DynamiCrafter_512 = baseline/checkpoints/backbone.ckpt (10.4GB, 로컬 보유)
+151:- Eval 입력: `/home1/sota/inha2026/data/eval/{images, actions}/` (216 sample)
+157:- **이 문서 (RULES_v3_FINAL.md)** — 유일한 최종 지침
+159:- `codex_v5.txt` — 규정 준수 top-3
+160:- `codex_v6.txt` — DynamiCrafter top-1, HunyuanVideo 제외
+166:- Job 30629 fresh_infer: Fresh DiT 216 sample inference (결과 확인 필요)
+167:- Job 30630 b4_smoke: E-loss v5b smoke (참고, 우선순위 낮음)
+FILE:/home1/sota/inha2026/baseline/IMPLEMENTATION_NOTES.md
+14:- 영상: `videos/observation.images.image/chunk-*/video_episode_*.mp4`
+63:        + λ_dino  * L_dino      # DINOv2 cosine (visual fidelity)
+140:| `lvdm/models/ddpm3d.py` | `LatentDiffusion._extra_losses` 훅 + `LatentVisualDiffusion` perceptual loss |
+182:### 미확인 사항 (우선순위 순)
+198:CosmosActionCondition(raw_actions=<17,46>)         → ValueError (__post_init__ 검증)
+247:최근 변종 간 차이(0.0005)보다 **40배 크다.** `select_holdout`은 결정적·seed 고정이므로
+255:**결론**: FAIL. 자세한 근거는 `docs/plans/road-to-0.17/track_b_summary.md`.
+272:- 8시간 예산 중 실제 사용 ~2시간. Track A 우선순위.
+295:- G1~G4 PASS, G5 (falsification) FAIL: `D_action/D_seed=0.64` (target ≥2), `D_rev/D_seed=0.14` (target ≥1.5)
+296:- 결론: Predict2.5 action-cond은 SO-100 첫 프레임에서 action-agnostic 응답. 6일 남은 상황에서 마이그레이션 비추.
+304:3. **`Video2WorldActionConditionedPipeline.__call__`은 T=1 이미지에서 크래시** (`temporal_sample`이 `original_length - expected_length > 0` 요구). 첫 프레임 13번 복제로 우회, 샘플러 루프 수동 실행.
+318:2. 마스크 수정 후 파일럿 재실행. `D_action/D_seed ≥ 2` 나오면 LoRA로 진행.
+333:결론: Cosmos3-Edge 계열은 SO-100에 재활용 불가. Cosmos3-Nano-Policy-DROID도 동일 문제(도메인 슬롯 훈련 없음)로 동일 결론. 남은 6일은 0.24524 방어에 집중.
+
+codex
+냉정한 결론: **극단 시도의 현실적 목표는 0.2407을 0.238 전후로 낮추는 것**입니다. `-0.01/-0.02`급은 현재 증거상 거의 환상이며, 먼저 `w0025/12k` 실측이 최우선입니다.
+
+1. P1~P4 upside
+
+- **P1 inference sweep:** `0.24524 대비 -0.004~-0.008`, 현 B4 대비 `0~-0.003`가 현실적. 고정 seed로 CFG×steps만 먼저 보십시오. 200-step은 비용 대비 이득이 작고 sampler 교체는 분포 붕괴 위험이 있습니다. GT/zero/shuffle는 **action sensitivity 진단용**이지 후보 선택용이 아닙니다.
+- **P2 후처리:** 기대값 `0~+0.01`(악화 가능성이 더 큼). interpolation/SR은 로봇 motion timing과 texture를 바꿔 Action/R3D 양쪽을 손상할 수 있습니다.
+- **P3 zero-shot I2V:** 대체로 `+0.01 이상 악화`. Wan2.2-TI2V-5B는 visual prior는 좋지만 6-DoF action grounding이 없습니다. Predict2.5는 G5에서 이미 폐기됐습니다. 전체 216 inference 전에 12–24개 fixed pilot의 action/shuffle sensitivity로 즉시 kill해야 합니다.
+- **P4 ensemble:** hard per-sample selection `0~-0.002`; pixel/latent blend는 ghosting 때문에 악화 가능성이 큼. E 단독 선택은 B4v2/Z6-B4 실패를 재현할 위험이 있습니다.
+
+2. P2 규정
+
+현재 문구라면 **RIFE/FILM/SR/color-match는 제출 금지로 판단**합니다. 생성 후 프레임을 바꾸며 judge 입력 자체를 수정하기 때문입니다. “pipeline 일부”라는 명칭은 방어가 아닙니다. 명시적으로 허용된 first-frame anchor/paste만 유지하고, 나머지는 운영진의 서면 허가 없이는 쓰지 마십시오.
+
+3. 놓친 시도
+
+가장 유망한 것은 **모델-space interpolation**입니다: base↔B4↔`w0025/12k` LoRA/adapter delta를 0.25/0.5/0.75로 보간. 직접 생성하므로 P2보다 규정상 깨끗하고, visual-action Pareto를 복원할 가능성이 있습니다(`B4 대비 -0.001~-0.003`).
+
+RAFT conditioning은 새 학습이 필요해 늦고, recursive T=1 생성은 drift 누적, latent/pixel blending은 ghosting, CFG++/STG는 모델이 해당 unconditional branch를 제대로 학습했을 때만 유효합니다. GT-video nudge/inpainting은 평가 GT가 있다면 누출이며 금지, 없다면 불가능합니다. 자체 clone을 이용한 test-time refinement는 proxy exploitation 위험 때문에 폐기하십시오.
+
+4. 즉시 launch Top-3
+
+1. `w0025/12k` visual sanity 후 실측  
+2. base/B4/w0025 **weight interpolation sweep**  
+3. B4와 w0025 대상으로 fixed-seed CFG/steps 소형 sweep  
+
+진행 중 `w005/w0075`는 새 학습 없이 checkpoint 평가만 완료하십시오.
+
+5. 자동화
+
+기존 루프를 오염시키지 말고 `auto_loop_extreme.py`로 분리하십시오. Done 기준은 고정 validation에서:
+
+- E-invdyn mean/median 개선
+- clean-room visual: LPIPS 또는 외부 pretrained image/video embedding 악화 ≤1%
+- GT/zero/shuffle action sensitivity
+- temporal flow/first-frame drift
+- 216개 완성, CSV schema/hash 검증
+
+단일 합산점수 대신 **Pareto gate**를 쓰십시오.
+
+6. 슬롯
+
+`N=5`라면 `w0025 1 / weight interpolation 1 / P1 1 / P4 hard-select 1 / 최종 reserve 1`. `N≤3`이면 `w0025 1`, interpolation 또는 P1 중 하나 `1`, reserve `1`. 실측 결과를 보고 다음 seed를 고르는 연쇄 제출은 하지 마십시오.
+
+이 판단은 이전 원칙과 일치합니다. **마지막 6–10시간은 inference·검증·제출 버퍼로 고정**하고, 새 backbone 전체 inference나 새 학습은 그 경계를 침범하면 즉시 중단해야 합니다.
+tokens used
+27,107
+냉정한 결론: **극단 시도의 현실적 목표는 0.2407을 0.238 전후로 낮추는 것**입니다. `-0.01/-0.02`급은 현재 증거상 거의 환상이며, 먼저 `w0025/12k` 실측이 최우선입니다.
+
+1. P1~P4 upside
+
+- **P1 inference sweep:** `0.24524 대비 -0.004~-0.008`, 현 B4 대비 `0~-0.003`가 현실적. 고정 seed로 CFG×steps만 먼저 보십시오. 200-step은 비용 대비 이득이 작고 sampler 교체는 분포 붕괴 위험이 있습니다. GT/zero/shuffle는 **action sensitivity 진단용**이지 후보 선택용이 아닙니다.
+- **P2 후처리:** 기대값 `0~+0.01`(악화 가능성이 더 큼). interpolation/SR은 로봇 motion timing과 texture를 바꿔 Action/R3D 양쪽을 손상할 수 있습니다.
+- **P3 zero-shot I2V:** 대체로 `+0.01 이상 악화`. Wan2.2-TI2V-5B는 visual prior는 좋지만 6-DoF action grounding이 없습니다. Predict2.5는 G5에서 이미 폐기됐습니다. 전체 216 inference 전에 12–24개 fixed pilot의 action/shuffle sensitivity로 즉시 kill해야 합니다.
+- **P4 ensemble:** hard per-sample selection `0~-0.002`; pixel/latent blend는 ghosting 때문에 악화 가능성이 큼. E 단독 선택은 B4v2/Z6-B4 실패를 재현할 위험이 있습니다.
+
+2. P2 규정
+
+현재 문구라면 **RIFE/FILM/SR/color-match는 제출 금지로 판단**합니다. 생성 후 프레임을 바꾸며 judge 입력 자체를 수정하기 때문입니다. “pipeline 일부”라는 명칭은 방어가 아닙니다. 명시적으로 허용된 first-frame anchor/paste만 유지하고, 나머지는 운영진의 서면 허가 없이는 쓰지 마십시오.
+
+3. 놓친 시도
+
+가장 유망한 것은 **모델-space interpolation**입니다: base↔B4↔`w0025/12k` LoRA/adapter delta를 0.25/0.5/0.75로 보간. 직접 생성하므로 P2보다 규정상 깨끗하고, visual-action Pareto를 복원할 가능성이 있습니다(`B4 대비 -0.001~-0.003`).
+
+RAFT conditioning은 새 학습이 필요해 늦고, recursive T=1 생성은 drift 누적, latent/pixel blending은 ghosting, CFG++/STG는 모델이 해당 unconditional branch를 제대로 학습했을 때만 유효합니다. GT-video nudge/inpainting은 평가 GT가 있다면 누출이며 금지, 없다면 불가능합니다. 자체 clone을 이용한 test-time refinement는 proxy exploitation 위험 때문에 폐기하십시오.
+
+4. 즉시 launch Top-3
+
+1. `w0025/12k` visual sanity 후 실측  
+2. base/B4/w0025 **weight interpolation sweep**  
+3. B4와 w0025 대상으로 fixed-seed CFG/steps 소형 sweep  
+
+진행 중 `w005/w0075`는 새 학습 없이 checkpoint 평가만 완료하십시오.
+
+5. 자동화
+
+기존 루프를 오염시키지 말고 `auto_loop_extreme.py`로 분리하십시오. Done 기준은 고정 validation에서:
+
+- E-invdyn mean/median 개선
+- clean-room visual: LPIPS 또는 외부 pretrained image/video embedding 악화 ≤1%
+- GT/zero/shuffle action sensitivity
+- temporal flow/first-frame drift
+- 216개 완성, CSV schema/hash 검증
+
+단일 합산점수 대신 **Pareto gate**를 쓰십시오.
+
+6. 슬롯
+
+`N=5`라면 `w0025 1 / weight interpolation 1 / P1 1 / P4 hard-select 1 / 최종 reserve 1`. `N≤3`이면 `w0025 1`, interpolation 또는 P1 중 하나 `1`, reserve `1`. 실측 결과를 보고 다음 seed를 고르는 연쇄 제출은 하지 마십시오.
+
+이 판단은 이전 원칙과 일치합니다. **마지막 6–10시간은 inference·검증·제출 버퍼로 고정**하고, 새 backbone 전체 inference나 새 학습은 그 경계를 침범하면 즉시 중단해야 합니다.
